@@ -45,10 +45,34 @@ def select_best_mask_logits(output: Dict[str, torch.Tensor]) -> Tuple[torch.Tens
 
 
 def normalized_xyxy_prompts(find_input: Any) -> Sequence[Optional[torch.Tensor]]:
+    boxes_tensor = find_input.input_boxes
+    boxes_mask = find_input.input_boxes_mask
+    if boxes_tensor.ndim != 3 or boxes_tensor.shape[-1] != 4:
+        raise ValueError(
+            f"input_boxes must be a 3D tensor ending in 4, got {boxes_tensor.shape}"
+        )
+    if boxes_mask.ndim != 2:
+        raise ValueError(f"input_boxes_mask must be 2D, got {boxes_mask.shape}")
+
+    num_queries, num_boxes = boxes_mask.shape
+    batch_first = boxes_tensor.shape[:2] == (num_queries, num_boxes)
+    boxes_first = boxes_tensor.shape[:2] == (num_boxes, num_queries)
+    if not batch_first and not boxes_first:
+        raise ValueError(
+            "input_boxes and input_boxes_mask have incompatible shapes: "
+            f"{boxes_tensor.shape} versus {boxes_mask.shape}"
+        )
+
     prompts = []
-    for query_index in range(find_input.input_boxes.shape[0]):
-        boxes = find_input.input_boxes[query_index]
-        boxes = boxes[~find_input.input_boxes_mask[query_index]]
+    for query_index in range(num_queries):
+        # SAM3 variants use either [B_queries, N_boxes, 4] or
+        # [N_boxes, B_queries, 4]. The mask is consistently query-first.
+        boxes = (
+            boxes_tensor[query_index]
+            if batch_first
+            else boxes_tensor[:, query_index]
+        )
+        boxes = boxes[~boxes_mask[query_index]]
         if boxes.numel():
             center, size = boxes[..., :2], boxes[..., 2:]
             boxes = torch.cat((center - size / 2, center + size / 2), dim=-1)

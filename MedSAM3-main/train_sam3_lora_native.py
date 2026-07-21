@@ -1166,15 +1166,13 @@ class SAM3TrainerNative:
             if self.svanet_adapter is not None:
                 # SAM3 stores prompts as normalized CxCyWH. The ROI adapter
                 # accepts normalized XYXY.
-                box_prompts = []
-                for query_index in batch_idx.tolist():
-                    boxes = find_input.input_boxes[query_index]
-                    box_mask = find_input.input_boxes_mask[query_index]
-                    boxes = boxes[~box_mask]
-                    if boxes.numel():
-                        center, size = boxes[..., :2], boxes[..., 2:]
-                        boxes = torch.cat((center - size / 2, center + size / 2), dim=-1)
-                    box_prompts.append(boxes)
+                from models.inference_utils import normalized_xyxy_prompts
+
+                query_box_prompts = normalized_xyxy_prompts(find_input)
+                box_prompts = [
+                    query_box_prompts[query_index]
+                    for query_index in batch_idx.tolist()
+                ]
                 teacher_area_mask = routes.get("teacher_area_mask")
                 if (
                     self.svanet_adapter.training
