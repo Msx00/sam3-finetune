@@ -985,7 +985,11 @@ class SAM3TrainerNative:
                 self.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=False  # Frozen params (requires_grad=False) don't need this flag
+                # Top-1 MoE routing intentionally skips experts that are not
+                # selected by the local batch. The selected experts can also
+                # differ across ranks, so the set of parameters receiving a
+                # gradient is dynamic and DDP must detect unused parameters.
+                find_unused_parameters=True,
             )
             print_rank0(f"Model wrapped with DistributedDataParallel")
 
