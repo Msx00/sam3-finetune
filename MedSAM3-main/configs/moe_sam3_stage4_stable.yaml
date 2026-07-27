@@ -71,8 +71,8 @@ dataset:
   us_test_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/test_boxes_xyxy.json"
   train_split: train
   val_split: val
-  num_mr_patients: 210
-  num_us_patients: 210
+  num_mr_patients: 50
+  num_us_patients: 50
   patient_sampling:
     mode: random
     seed: 42
@@ -158,23 +158,23 @@ stages:
   train_shared_lora_stage5: false
 
 training:
-  stage: 2
-  epochs: 25
-  num_epochs: 25
-  batch_size: 8
-  num_workers: 4
+  stage: 4
+  epochs: 1
+  num_epochs: 1
+  batch_size: 4
+  num_workers: 0
   learning_rate: 0.00005
   weight_decay: 0.0001
   data_dir: ""
   amp: false
-  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3
-  resume: ""
+  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/debug
+  resume: null
   log_interval: 10
-  validation_interval: 1
+  validation_interval: 999
   scheduler:
     enabled: false
     type: cosine
     eta_min: 0.0
 
 output:
-  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3_v2
+  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/debug_stage4_experiment

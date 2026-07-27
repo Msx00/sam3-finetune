@@ -118,6 +118,7 @@ class ExpertPool(nn.Module):
         delta = torch.zeros(
             (*x.shape[:-1], self.out_features), device=x.device, dtype=x.dtype
         )
+        ddp_zero = None
         hard_routing = bool(
             torch.all((joint_weights.detach() == 0) | (joint_weights.detach() == 1))
         )
@@ -129,7 +130,13 @@ class ExpertPool(nn.Module):
                     selected = (weight.detach() != 0).nonzero(as_tuple=False).flatten()
                     if selected.numel() == 0:
                         # Do not execute an unselected top-1 expert. Its
-                        # parameters therefore receive no gradient from this sample.
+                        # parameters normally receive no gradient from this sample.
+                        # Under DDP, keep a zero-valued autograd dependency so
+                        # every rank participates in reduction for every expert
+                        # without paying for an expert forward pass.
+                        if torch.distributed.is_initialized():
+                            zero = expert.A.sum() + expert.B.sum()
+                            ddp_zero = zero if ddp_zero is None else ddp_zero + zero
                         continue
                     contribution = expert(x.index_select(0, selected))
                     selected_weight = weight.index_select(0, selected).to(x.dtype)
@@ -143,6 +150,8 @@ class ExpertPool(nn.Module):
                 weight = weight.to(dtype=x.dtype)
                 weight = weight.view(x.shape[0], *([1] * (x.ndim - 1)))
                 delta = delta + expert(x) * weight
+        if ddp_zero is not None:
+            delta = delta + ddp_zero.to(delta.dtype) * 0.0
         return delta
 
 

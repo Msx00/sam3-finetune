@@ -396,9 +396,60 @@ class SvANetROIAdapter(nn.Module):
 
         final_logits = sam3_logits.clone()
         roi_logits_list: List[torch.Tensor] = []
+        debug_enabled = bool(os.environ.get("SVANET_DEBUG_MODE", "").strip())
+        rank = os.environ.get("RANK", "0")
         if roi_images:
             model_input = torch.stack(roi_images).to(images.device, dtype=images.dtype)
+            targets = torch.stack(roi_targets).float() if roi_targets else None
+            input_finite = bool(torch.isfinite(model_input).all())
+            targets_finite = (
+                bool(torch.isfinite(targets).all()) if targets is not None else True
+            )
+            if debug_enabled:
+                target_summary = (
+                    f"target_finite={targets_finite} "
+                    f"target_min={targets.nan_to_num().min().item():.6f} "
+                    f"target_max={targets.nan_to_num().max().item():.6f} "
+                    f"target_fg_ratio={targets.nan_to_num().mean().item():.8f}"
+                    if targets is not None
+                    else "target_finite=True target=unavailable"
+                )
+                print(
+                    f"[SVANET-DEBUG][rank={rank}] "
+                    f"roi_count={len(roi_images)} "
+                    f"input_shape={tuple(model_input.shape)} "
+                    f"input_finite={input_finite} "
+                    f"input_min={model_input.nan_to_num().min().item():.6f} "
+                    f"input_max={model_input.nan_to_num().max().item():.6f} "
+                    f"{target_summary}",
+                    flush=True,
+                )
+            if not input_finite:
+                raise FloatingPointError("SvANet ROI input contains NaN/Inf")
+            if not targets_finite:
+                raise FloatingPointError("SvANet ROI target contains NaN/Inf")
+            if targets is not None and (
+                bool((targets < 0).any()) or bool((targets > 1).any())
+            ):
+                raise ValueError(
+                    "SvANet ROI target must be binary/in [0, 1], got "
+                    f"[{targets.min().item()}, {targets.max().item()}]"
+                )
             roi_logits = self._foreground_logits(self._svanet_forward(model_input))
+            logits_finite = bool(torch.isfinite(roi_logits).all())
+            if debug_enabled:
+                print(
+                    f"[SVANET-DEBUG][rank={rank}] "
+                    f"logits_shape={tuple(roi_logits.shape)} "
+                    f"logits_finite={logits_finite} "
+                    f"logits_min={roi_logits.nan_to_num().min().item():.6f} "
+                    f"logits_max={roi_logits.nan_to_num().max().item():.6f} "
+                    f"logits_mean={roi_logits.nan_to_num().mean().item():.6f} "
+                    f"logits_abs_max={roi_logits.nan_to_num().abs().max().item():.6f}",
+                    flush=True,
+                )
+            if not logits_finite:
+                raise FloatingPointError("SvANet forward produced NaN/Inf logits")
             if roi_logits.shape[-2:] != self.input_size:
                 roi_logits = F.interpolate(
                     roi_logits[:, None].float(), self.input_size,
@@ -419,11 +470,26 @@ class SvANetROIAdapter(nn.Module):
                     final_logits[image_index, y1:y2, x1:x2] = 0.5 * (base + resized)
                 roi_logits_list.append(roi_logits[local_index])
             refine_loss = (
-                dice_bce_with_logits(roi_logits, torch.stack(roi_targets))
+                dice_bce_with_logits(
+                    roi_logits,
+                    torch.stack(roi_targets),
+                    debug_label="refine",
+                )
                 if gt_masks is not None else self._zero_refine_loss(images)
             )
         else:
             refine_loss = self._zero_refine_loss(images)
+            if debug_enabled:
+                print(
+                    f"[SVANET-DEBUG][rank={rank}] "
+                    f"roi_count=0 refine_loss={refine_loss.detach().item():.8f}",
+                    flush=True,
+                )
+            if not torch.isfinite(refine_loss):
+                raise FloatingPointError(
+                    "Zero-trigger SvANet refine loss is NaN/Inf; "
+                    "the SvANet parameters are already contaminated"
+                )
 
         self.runtime_stats["trigger_count"] += len(trigger_indices)
         widths = [roi[2] - roi[0] for roi in rois]
