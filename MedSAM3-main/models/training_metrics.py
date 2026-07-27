@@ -36,6 +36,7 @@ class EpochStatistics:
     def __init__(self) -> None:
         self.loss_sums = defaultdict(float)
         self.loss_batches = 0
+        self.loss_weight = 0
         self.router_correct = defaultdict(int)
         self.router_total = defaultdict(int)
         self.entropy_sum = defaultdict(float)
@@ -53,12 +54,19 @@ class EpochStatistics:
         self.svanet_batches = 0
         self.slice_records = []
 
-    def update_losses(self, components: Mapping[str, Any]) -> None:
+    def update_losses(self, components: Mapping[str, Any], weight: int = 1) -> None:
+        """Accumulate batch-mean losses weighted by the effective batch size."""
+        weight = max(int(weight), 1)
         for name in LOSS_NAMES:
             value = components.get(name)
             if value is not None:
-                self.loss_sums[name] += float(value.detach().item() if torch.is_tensor(value) else value)
+                scalar = float(
+                    value.detach().float().item()
+                    if torch.is_tensor(value) else value
+                )
+                self.loss_sums[name] += scalar * weight
         self.loss_batches += 1
+        self.loss_weight += weight
 
     def update_router(
         self, routes: Mapping[str, torch.Tensor], targets: Mapping[str, torch.Tensor]
@@ -143,6 +151,7 @@ class EpochStatistics:
     def merge(self, other: "EpochStatistics") -> None:
         for name, value in other.loss_sums.items(): self.loss_sums[name] += value
         self.loss_batches += other.loss_batches
+        self.loss_weight += other.loss_weight
         for name, value in other.router_correct.items(): self.router_correct[name] += value
         for name, value in other.router_total.items(): self.router_total[name] += value
         for name, value in other.entropy_sum.items(): self.entropy_sum[name] += value
@@ -211,7 +220,7 @@ class EpochStatistics:
         }
         return {
             "loss": {
-                name: self.loss_sums[name] / self.loss_batches if self.loss_batches else 0.0
+                name: self.loss_sums[name] / self.loss_weight if self.loss_weight else 0.0
                 for name in LOSS_NAMES
             },
             "router": router,

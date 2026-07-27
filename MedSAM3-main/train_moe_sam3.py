@@ -10,6 +10,7 @@ import os
 
 import yaml
 
+from models.wandb_logger import add_wandb_arguments, resolve_wandb_settings
 from train_sam3_lora_native import (
     SAM3TrainerNative,
     launch_distributed_training,
@@ -32,6 +33,7 @@ def parse_args():
     )
     parser.add_argument("--_launched_by_torchrun", action="store_true")
     parser.add_argument("--resume", default=None, help="Resume same-stage checkpoint")
+    add_wandb_arguments(parser)
     return parser.parse_args()
 
 
@@ -47,6 +49,7 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
+    wandb_settings = resolve_wandb_settings(args, config)
     moe_config = dict(config.get("moe") or {})
     if not moe_config or not moe_config.get("enabled", True):
         raise ValueError("train_moe_sam3.py requires moe.enabled=true")
@@ -65,8 +68,12 @@ def main():
         training_stage=training_stage,
         svanet_config=config.get("svanet"),
         resume_path=args.resume,
+        wandb_settings=wandb_settings,
     )
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        trainer.finish_wandb()
 
 
 if __name__ == "__main__":

@@ -785,6 +785,7 @@ class SAM3TrainerNative:
         svanet_config=None,
         resume_path=None,
         load_stage_dependencies=True,
+        wandb_settings=None,
     ):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
@@ -801,6 +802,9 @@ class SAM3TrainerNative:
         self.resume_path = resume_path
         self.patient_datasets = []
         self.validation_patient_datasets = []
+        self.wandb_settings = dict(wandb_settings or {})
+        self.wandb_logger = None
+        self.global_step = 0
 
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
@@ -1116,6 +1120,32 @@ class SAM3TrainerNative:
             normalize_by_valid_object_num=False,
         )
 
+        from models.wandb_logger import WandbLogger
+
+        wandb_config = {
+            "training_config": self.config,
+            "training_stage": self.training_stage,
+            "world_size": self.world_size,
+        }
+        self.wandb_logger = WandbLogger(
+            self.wandb_settings,
+            config=wandb_config,
+            main_process=is_main_process(),
+        )
+        self.wandb_settings.pop("api_key", None)
+        if (
+            self.wandb_settings.get("watch_model", False)
+            and self.wandb_logger.enabled
+        ):
+            self.wandb_logger.watch(self._unwrapped_model)
+            if self._unwrapped_svanet is not None:
+                self.wandb_logger.watch(self._unwrapped_svanet)
+
+    def finish_wandb(self):
+        """Finish the optional rank-zero W&B run without masking failures."""
+        if self.wandb_logger is not None:
+            self.wandb_logger.finish()
+
     def _add_moe_aux_loss(
         self, total_loss, outputs_list=None, find_targets=None,
         input_batch=None, metadata=None, epoch=0,
@@ -1300,6 +1330,8 @@ class SAM3TrainerNative:
     def _save_stage_checkpoint(self, out_dir, epoch, loss, best=False):
         if self.stage_manager is None:
             return
+        from models.wandb_logger import sanitize_config
+
         name = (
             self.stage_manager.checkpoint_name
             if best else f"stage{self.training_stage}_{self.stage_manager.stage_config.get('last_suffix', 'last')}.pt"
@@ -1313,7 +1345,7 @@ class SAM3TrainerNative:
             selected_patient_ids=self._selected_patient_state(),
             area_thresholds=self._dataset_threshold_state("area_thresholds"),
             boundary_thresholds=self._dataset_threshold_state("boundary_thresholds"),
-            config=self.config,
+            config=sanitize_config(self.config, remove_paths=False),
         )
 
     def _selected_patient_state(self):
@@ -1340,6 +1372,109 @@ class SAM3TrainerNative:
         for item in gathered:
             merged.merge(item)
         return merged
+
+    def _current_learning_rate_metrics(self):
+        metrics = {}
+        for index, group in enumerate(self.optimizer.param_groups):
+            name = str(group.get("group_name", f"group_{index}"))
+            metrics[f"train/lr_{name}"] = float(group["lr"])
+            if index == 0:
+                metrics["train/lr"] = float(group["lr"])
+        return metrics
+
+    def _reduce_scalar_metrics(self, metrics):
+        """Average low-cost scalar batch metrics across DDP ranks."""
+        if not self.multi_gpu or not metrics:
+            return metrics
+        keys = sorted(metrics)
+        values = torch.tensor(
+            [float(metrics[key]) for key in keys],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        values /= self.world_size
+        return {
+            key: float(value)
+            for key, value in zip(keys, values.detach().cpu().tolist())
+        }
+
+    @staticmethod
+    def _wandb_report_metrics(prefix, report):
+        """Map the existing globally merged epoch report to W&B scalars."""
+        metrics = {}
+        losses = report.get("loss", {})
+        total_loss = losses.get("total_loss")
+        if total_loss is not None:
+            metrics[f"{prefix}/epoch_loss"] = float(total_loss)
+            metrics[f"{prefix}/loss"] = float(total_loss)
+        for name, value in losses.items():
+            metrics[f"{prefix}/epoch_{name}"] = float(value)
+            if name != "total_loss":
+                metrics[f"{prefix}/{name}"] = float(value)
+        for name, value in report.get("segmentation", {}).items():
+            metrics[f"{prefix}/{name}"] = float(value)
+        for name, value in report.get("router", {}).items():
+            metrics[f"{prefix}/router/{name}"] = float(value)
+        for name, value in report.get("svanet", {}).items():
+            metrics[f"{prefix}/svanet/{name}"] = float(value)
+        svanet = report.get("svanet", {})
+        small_count = float(svanet.get("small_count", 0))
+        trigger_count = float(svanet.get("trigger_count", 0))
+        metrics[f"{prefix}/svanet/trigger_ratio"] = (
+            trigger_count / small_count if small_count else 0.0
+        )
+
+        experts = report.get("experts", {})
+        for name, value in experts.items():
+            metrics[f"{prefix}/experts/{name}_count"] = float(value)
+        for family in ("MR_area", "US_area", "MR_boundary", "US_boundary"):
+            selected = {
+                name: float(value)
+                for name, value in experts.items()
+                if name.startswith(f"{family}_")
+            }
+            total = sum(selected.values())
+            for name, value in selected.items():
+                metrics[f"{prefix}/experts/{name}_ratio"] = (
+                    value / total if total else 0.0
+                )
+        area_total = sum(
+            float(value) for name, value in experts.items() if "_area_" in name
+        )
+        boundary_total = sum(
+            float(value)
+            for name, value in experts.items()
+            if "_boundary_" in name
+        )
+        for modality in ("MR", "US"):
+            count = sum(
+                float(value)
+                for name, value in experts.items()
+                if name.startswith(f"{modality}_area_")
+            )
+            metrics[f"{prefix}/router/modality_{modality}_ratio"] = (
+                count / area_total if area_total else 0.0
+            )
+        for label in ("small", "medium", "large"):
+            count = sum(
+                float(value)
+                for name, value in experts.items()
+                if name.endswith(f"_area_{label}")
+            )
+            metrics[f"{prefix}/router/area_{label}_ratio"] = (
+                count / area_total if area_total else 0.0
+            )
+        for label in ("clear", "fuzzy", "complex"):
+            count = sum(
+                float(value)
+                for name, value in experts.items()
+                if name.endswith(f"_boundary_{label}")
+            )
+            metrics[f"{prefix}/router/boundary_{label}_ratio"] = (
+                count / boundary_total if boundary_total else 0.0
+            )
+        return metrics
 
     @staticmethod
     def _write_statistics_record(path, record):
@@ -1564,6 +1699,10 @@ class SAM3TrainerNative:
             num_workers=self.config["training"].get("num_workers", 0),
             pin_memory=True
         )
+        # There is exactly one optimizer update per training batch and no
+        # gradient accumulation in this trainer. Checkpoints store epoch but not
+        # optimizer-step count, so resumed runs reconstruct the completed steps.
+        self.global_step = self.start_epoch * len(train_loader)
 
         if has_validation:
             val_loader = DataLoader(
@@ -1757,7 +1896,11 @@ class SAM3TrainerNative:
                 )
 
                 if self.moe_controller is not None:
-                    train_statistics.update_losses(self.last_router_losses)
+                    batch_metadata = batch_dict.get("_patient_metadata") or []
+                    train_statistics.update_losses(
+                        self.last_router_losses,
+                        weight=len(batch_metadata) or 1,
+                    )
                     train_statistics.update_router(
                         self.moe_controller.current_routes,
                         self.moe_controller.routing_targets,
@@ -1824,6 +1967,7 @@ class SAM3TrainerNative:
                         f"largest_grad_name={largest_grad_name}"
                     )
                 self.optimizer.step()
+                self.global_step += 1
                 if debug_mode == "train_bn_eval":
                     bad_parameters = [
                         name
@@ -1842,6 +1986,33 @@ class SAM3TrainerNative:
                 # Track training loss
                 train_losses.append(total_loss.item())
                 pbar.set_postfix({"loss": total_loss.item()})
+                should_log_wandb = (
+                    self.wandb_settings.get("enabled", False)
+                    and self.global_step % self.wandb_logger.log_interval == 0
+                )
+                epoch_batch_limit = (
+                    min(len(train_loader), debug_max_batches)
+                    if debug_max_batches > 0 else len(train_loader)
+                )
+                if should_log_wandb and batch_index + 1 < epoch_batch_limit:
+                    batch_metrics = {
+                        "train/loss": float(total_loss.detach().float().item()),
+                        "train/epoch": epoch + 1,
+                        "train/iteration": batch_index + 1,
+                        "train/global_step": self.global_step,
+                    }
+                    for name, value in self.last_router_losses.items():
+                        if name == "total_loss":
+                            continue
+                        if torch.is_tensor(value) and value.numel() == 1:
+                            batch_metrics[f"train/{name}"] = float(
+                                value.detach().float().item()
+                            )
+                        elif isinstance(value, (int, float)):
+                            batch_metrics[f"train/{name}"] = float(value)
+                    batch_metrics.update(self._current_learning_rate_metrics())
+                    batch_metrics = self._reduce_scalar_metrics(batch_metrics)
+                    self.wandb_logger.log(batch_metrics, step=self.global_step)
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
@@ -1923,7 +2094,11 @@ class SAM3TrainerNative:
                         )
 
                         if self.moe_controller is not None:
-                            val_statistics.update_losses(self.last_router_losses)
+                            batch_metadata = batch_dict.get("_patient_metadata") or []
+                            val_statistics.update_losses(
+                                self.last_router_losses,
+                                weight=len(batch_metadata) or 1,
+                            )
                             val_statistics.update_router(
                                 self.moe_controller.current_routes,
                                 self.moe_controller.routing_targets,
@@ -1948,6 +2123,24 @@ class SAM3TrainerNative:
                 print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
                 if self.scheduler is not None:
                     self.scheduler.step()
+                epoch_metrics = self._wandb_report_metrics("train", train_report)
+                epoch_metrics.update(
+                    self._wandb_report_metrics("val", val_report)
+                )
+                epoch_metrics.update(self._current_learning_rate_metrics())
+                epoch_metrics.update({
+                    "train/epoch": epoch + 1,
+                    "train/iteration": len(train_losses),
+                    "train/global_step": self.global_step,
+                    "val/loss": avg_val_loss,
+                })
+                is_new_best = avg_val_loss < best_val_loss
+                if is_new_best:
+                    epoch_metrics.update({
+                        "best/epoch": epoch + 1,
+                        "best/val_loss": avg_val_loss,
+                    })
+                self.wandb_logger.log(epoch_metrics, step=self.global_step)
                 if is_main_process() and self.moe_controller is not None:
                     record = {
                         "epoch": epoch + 1,
@@ -1971,7 +2164,7 @@ class SAM3TrainerNative:
                         out_dir, epoch=epoch + 1, loss=avg_val_loss, best=False
                     )
 
-                    if avg_val_loss < best_val_loss:
+                    if is_new_best:
                         best_val_loss = avg_val_loss
                         self._save_adapter_weights(model_to_save, out_dir / "best_lora_weights.pt")
                         self._save_stage_checkpoint(
@@ -1998,6 +2191,14 @@ class SAM3TrainerNative:
                 # No validation - just save model each epoch (only on rank 0)
                 if self.scheduler is not None:
                     self.scheduler.step()
+                epoch_metrics = self._wandb_report_metrics("train", train_report)
+                epoch_metrics.update(self._current_learning_rate_metrics())
+                epoch_metrics.update({
+                    "train/epoch": epoch + 1,
+                    "train/iteration": len(train_losses),
+                    "train/global_step": self.global_step,
+                })
+                self.wandb_logger.log(epoch_metrics, step=self.global_step)
                 if is_main_process():
                     model_to_save = self._unwrapped_model
                     self._save_adapter_weights(model_to_save, out_dir / "last_lora_weights.pt")
@@ -2094,6 +2295,32 @@ def launch_distributed_training(args):
     # Set environment variable for visible devices
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = device_str
+    if getattr(args, "wandb_api_key", None):
+        # Keep the key out of the child command line. The child resolves it
+        # from WANDB_API_KEY after the explicit parent CLI value wins here.
+        env["WANDB_API_KEY"] = str(args.wandb_api_key)
+    if getattr(args, "use_wandb", None):
+        cmd.append("--use-wandb")
+    if getattr(args, "wandb_watch_model", None):
+        cmd.append("--wandb-watch-model")
+    for option, attribute in (
+        ("--wandb-project", "wandb_project"),
+        ("--wandb-entity", "wandb_entity"),
+        ("--wandb-name", "wandb_name"),
+        ("--wandb-group", "wandb_group"),
+        ("--wandb-mode", "wandb_mode"),
+        ("--wandb-dir", "wandb_dir"),
+        ("--wandb-log-interval", "wandb_log_interval"),
+        ("--wandb-resume", "wandb_resume"),
+        ("--wandb-run-id", "wandb_run_id"),
+    ):
+        value = getattr(args, attribute, None)
+        if value not in (None, ""):
+            cmd.extend([option, str(value)])
+    wandb_tags = getattr(args, "wandb_tags", None)
+    if wandb_tags:
+        cmd.append("--wandb-tags")
+        cmd.extend(map(str, wandb_tags))
 
     # Run the subprocess
     result = subprocess.run(cmd, env=env)
