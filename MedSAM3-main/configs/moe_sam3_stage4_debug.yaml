@@ -158,17 +158,17 @@ stages:
   train_shared_lora_stage5: false
 
 training:
-  stage: 2
+  stage: 4
   epochs: 25
   num_epochs: 25
-  batch_size: 8
-  num_workers: 4
+  batch_size: 16
+  num_workers: 0
   learning_rate: 0.00005
   weight_decay: 0.0001
   data_dir: ""
   amp: false
-  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3
-  resume: ""
+  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/debug
+  resume:  null
   log_interval: 10
   validation_interval: 1
   scheduler:
@@ -177,4 +177,4 @@ training:
     eta_min: 0.0
 
 output:
-  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3_v2
+  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/debug_stage4_experiment

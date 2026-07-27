@@ -1628,9 +1628,43 @@ class SAM3TrainerNative:
 
         from models.training_metrics import EpochStatistics
 
+        debug_mode = os.environ.get("SVANET_DEBUG_MODE", "").strip().lower()
+        debug_max_batches = int(
+            os.environ.get("SVANET_DEBUG_MAX_BATCHES", "0")
+        )
+        valid_debug_modes = {
+            "",
+            "forward_bn_eval",
+            "forward_bn_train",
+            "train_bn_eval",
+        }
+        if debug_mode not in valid_debug_modes:
+            raise ValueError(
+                f"Unknown SVANET_DEBUG_MODE={debug_mode!r}; expected one of "
+                f"{sorted(mode for mode in valid_debug_modes if mode)}"
+            )
+
+        print_rank0(
+            f"SvANet debug mode: {debug_mode or 'disabled'}, "
+            f"max batches: {debug_max_batches or 'unlimited'}"
+        )
         for epoch in range(self.start_epoch, epochs):
             if self.stage_manager is not None:
                 self.stage_manager.set_module_modes(training=True)
+
+                if debug_mode in {"forward_bn_eval", "train_bn_eval"}:
+                    frozen_bn_count = 0
+                    for module in self._unwrapped_svanet.modules():
+                        if isinstance(
+                            module,
+                            torch.nn.modules.batchnorm._BatchNorm,
+                        ):
+                            module.eval()
+                            frozen_bn_count += 1
+                    print_rank0(
+                        f"[BN-DEBUG] epoch={epoch + 1} "
+                        f"frozen_batchnorm_modules={frozen_bn_count}"
+                    )
             self._log_patient_selection(epoch)
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
@@ -1649,9 +1683,18 @@ class SAM3TrainerNative:
 
             # Only show progress bar on rank 0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
-            for batch_dict in pbar:
-                input_batch = batch_dict["input"]
 
+            for batch_index, batch_dict in enumerate(pbar):
+                if (
+                    debug_max_batches > 0
+                    and batch_index >= debug_max_batches
+                ):
+                    print_rank0(
+                        f"Stopped after {debug_max_batches} debug batches"
+                    )
+                    break
+
+                input_batch = batch_dict["input"]
                 # Move to device
                 input_batch = move_to_device(input_batch, self.device)
                 self._set_moe_routing_targets(
@@ -1718,11 +1761,79 @@ class SAM3TrainerNative:
                     train_statistics.update_svanet(self.last_refine_output)
                     if self.last_metric_payload and self.last_metric_payload["metadata"]:
                         train_statistics.update_segmentation(**self.last_metric_payload)
+                if not torch.isfinite(total_loss):
+                    refine_loss = None
+
+                    if self.last_refine_output is not None:
+                        refine_loss = self.last_refine_output.get("refine_loss")
+
+                    refine_value = (
+                        refine_loss.detach().item()
+                        if torch.is_tensor(refine_loss)
+                        else refine_loss
+                    )
+
+                    raise FloatingPointError(
+                        f"Non-finite forward loss at batch {batch_index}: "
+                        f"total={total_loss.detach().item()}, "
+                        f"refine={refine_value}"
+                    )
+
+                if debug_mode in {"forward_bn_eval", "forward_bn_train"}:
+                    print_rank0(
+                        f"[DEBUG][batch={batch_index}] "
+                        f"forward-only total_loss={total_loss.detach().item():.8f}"
+                    )
+                    continue
 
                 # Backward
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
+                if debug_mode == "train_bn_eval":
+                    bad_gradients = []
+                    largest_grad_name = None
+                    largest_grad_value = 0.0
+                    for name, parameter in self._unwrapped_svanet.named_parameters():
+                        if not parameter.requires_grad or parameter.grad is None:
+                            continue
+                        if not torch.isfinite(parameter.grad).all():
+                            bad_gradients.append(name)
+                            continue
+                        grad_abs_max = parameter.grad.detach().abs().max().item()
+                        if grad_abs_max > largest_grad_value:
+                            largest_grad_value = grad_abs_max
+                            largest_grad_name = name
+                    if bad_gradients:
+                        raise FloatingPointError(
+                            "Non-finite SvANet gradients: "
+                            + ", ".join(bad_gradients[:20])
+                        )
+                    pre_clip_norm = torch.nn.utils.clip_grad_norm_(
+                        self._unwrapped_svanet.parameters(),
+                        max_norm=1.0,
+                        error_if_nonfinite=True,
+                    )
+                    print_rank0(
+                        f"[GRAD-DEBUG][batch={batch_index}] "
+                        f"pre_clip_norm={float(pre_clip_norm):.8f} "
+                        f"largest_grad={largest_grad_value:.8f} "
+                        f"largest_grad_name={largest_grad_name}"
+                    )
                 self.optimizer.step()
+                if debug_mode == "train_bn_eval":
+                    bad_parameters = [
+                        name
+                        for name, parameter in self._unwrapped_svanet.named_parameters()
+                        if not torch.isfinite(parameter.detach()).all()
+                    ]
+                    if bad_parameters:
+                        raise FloatingPointError(
+                            "Optimizer produced non-finite SvANet parameters: "
+                            + ", ".join(bad_parameters[:20])
+                        )
+                    print_rank0(
+                        f"[PARAM-DEBUG][batch={batch_index}] all_finite=True"
+                    )
 
                 # Track training loss
                 train_losses.append(total_loss.item())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -34,7 +35,10 @@ def dice_loss_from_probabilities(
 
 
 def dice_bce_with_logits(
-    logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    eps: float = 1e-6,
+    debug_label: Optional[str] = None,
 ) -> torch.Tensor:
     """Dice(sigmoid(logits), Y) + BCEWithLogits(logits, Y)."""
     logits = _as_mask_batch(logits)
@@ -48,7 +52,24 @@ def dice_bce_with_logits(
         )[:, 0].to(dtype=logits.dtype)
     dice = dice_loss_from_probabilities(logits.sigmoid(), targets, eps)
     bce = F.binary_cross_entropy_with_logits(logits, targets)
-    return dice + bce
+    total = dice + bce
+    if debug_label and os.environ.get("SVANET_DEBUG_MODE", "").strip():
+        rank = os.environ.get("RANK", "0")
+        print(
+            f"[LOSS-DEBUG][rank={rank}][{debug_label}] "
+            f"logits_finite={bool(torch.isfinite(logits).all())} "
+            f"targets_finite={bool(torch.isfinite(targets).all())} "
+            f"dice={dice.detach().item():.8f} "
+            f"bce={bce.detach().item():.8f} "
+            f"total={total.detach().item():.8f}",
+            flush=True,
+        )
+        if not torch.isfinite(total):
+            raise FloatingPointError(
+                f"Non-finite {debug_label} Dice+BCE loss: "
+                f"dice={dice.detach().item()}, bce={bce.detach().item()}"
+            )
+    return total
 
 
 def differentiable_boundary_map(values: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
