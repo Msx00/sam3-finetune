@@ -640,3 +640,101 @@ pytest tests -q
 - 当前未实现通过 YAML 自由选择 MoE decoder 层或 projection；注入位置固定在代码中。
 - 当前未实现 AMP 训练。
 - `infer_moe_sam3.py` 当前导出 PNG 和 JSON，不计算独立测试集汇总 Dice/IoU 报告。
+
+## 12. Weights & Biases 训练监控
+
+HMOE-SAM3 的 W&B 日志是可选功能，仅主进程（rank 0）创建和写入
+run。启用后会记录真实训练 loss 及各子 loss、当前学习率、epoch、
+optimizer global step、现有验证指标、Router 准确率/熵、专家使用计数
+与比例，以及已有的 SvANet 汇总统计。不会默认上传图像、mask、
+checkpoint 或患者标识。
+
+安装依赖：
+
+```bash
+cd /path/to/project/MedSAM3-main
+python -m pip install wandb
+```
+
+`debug.sh` 默认启用 W&B。推荐通过环境变量提供 API Key：
+
+```bash
+export WANDB_API_KEY="用户自己的真实APIKey"
+export WANDB_MODE="online"
+bash debug.sh
+```
+
+PowerShell 调用 Git Bash：
+
+```powershell
+cd "C:\Users\xin\Desktop\study\SAM\HMOE-SAM3"
+$env:WANDB_API_KEY = "用户自己的真实APIKey"
+$env:WANDB_MODE = "online"
+bash .\debug.sh
+```
+
+也可以只在本地把 `debug.sh` 中的：
+
+```bash
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+```
+
+临时改为：
+
+```bash
+export WANDB_API_KEY="用户自己的真实APIKey"
+```
+
+不要将真实 Key 提交到 Git，也不要把包含真实 Key 的脚本发给他人；
+提交前请检查 `git diff`。
+
+Python 入口也支持显式参数。注意命令行 Key 可能保存在 shell history
+中，也可能短暂出现在系统进程列表：
+
+```bash
+cd /path/to/project/MedSAM3-main
+python train_moe_sam3.py \
+  --config configs/moe_sam3_stage4_debug.yaml \
+  --device 0 \
+  --stage 4 \
+  --use-wandb \
+  --wandb-api-key "用户自己的真实APIKey" \
+  --wandb-project "HMOE-SAM3"
+```
+
+API Key 获取优先级为：`--wandb-api-key`、`WANDB_API_KEY`、本机已有
+`wandb login` 凭据。API Key 会从 W&B config 和 stage checkpoint
+配置副本中删除，也不会打印到日志。
+
+离线运行与后续同步：
+
+```bash
+WANDB_MODE=offline bash debug.sh
+wandb sync --sync-all
+```
+
+禁用 W&B：
+
+```bash
+USE_WANDB=0 bash debug.sh
+```
+
+PowerShell 可分别使用：
+
+```powershell
+$env:WANDB_MODE = "offline"
+bash .\debug.sh
+
+$env:USE_WANDB = "0"
+bash .\debug.sh
+```
+
+训练结束后清除环境变量：
+
+```bash
+unset WANDB_API_KEY
+```
+
+```powershell
+Remove-Item Env:WANDB_API_KEY
+```

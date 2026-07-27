@@ -178,3 +178,16 @@ training:
 
 output:
   output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3_v2
+wandb:
+  use_wandb: false
+  wandb_project: HMOE-SAM3
+  wandb_entity: null
+  wandb_name: null
+  wandb_group: null
+  wandb_tags: []
+  wandb_mode: online
+  wandb_dir: ./wandb
+  wandb_log_interval: 10
+  wandb_watch_model: false
+  wandb_resume: allow
+  wandb_run_id: null

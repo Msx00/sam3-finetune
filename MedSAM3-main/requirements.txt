@@ -56,8 +56,8 @@ psutil>=5.9.0
 torchmetrics>=1.0.0
 typing-extensions>=4.5.0
 
-# Optional: Weights & Biases for experiment tracking
-# wandb>=0.15.0
+# Weights & Biases for optional experiment tracking
+wandb>=0.15.0
 
 # Optional: TensorBoard for logging
 # tensorboard>=2.13.0
