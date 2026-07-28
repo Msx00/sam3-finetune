@@ -1,0 +1,193 @@
+# Complete Hierarchical LoRA-MoE-SAM3 configuration.
+
+model:
+  sam3_checkpoint: /mnt/afs/zhemin/zjx/Project/sam3/checkpoint/sam3.pt
+  stage1_checkpoint: ""
+  stage2_checkpoint: ""
+  stage3_checkpoint: ""
+  stage4_checkpoint: ""
+  freeze_image_encoder: true
+  shared_lora_rank: 8
+  expert_lora_rank: 8
+  expert_lora_alpha: 16
+  expert_lora_dropout: 0.0
+  moe_decoder_layers: [4, 5, 6]
+  moe_target_modules: [cross_attn.q_proj, cross_attn.v_proj]
+
+lora:
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, out_proj, qkv, proj, fc1, fc2, c_fc, c_proj, linear1, linear2]
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: true
+  apply_to_geometry_encoder: true
+  apply_to_detr_encoder: true
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+
+moe:
+  enabled: true
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  embed_dim: 256
+  router_hidden_dim: 256
+  routing_mode: top1
+  temperature: 1.0
+
+router:
+  routing_type: top1
+  modality_hidden_dim: 256
+  area_hidden_dim: 256
+  boundary_hidden_dim: 256
+  use_gt_modality_during_train: true
+  use_gt_area_during_warmup: true
+  use_gt_boundary_during_warmup: true
+  teacher_forcing:
+    enabled: true
+    start_ratio: 1.0
+    end_ratio: 0.0
+    decay_epochs: 20
+
+dataset:
+  mr_image_root: ""
+  mr_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d"
+  mr_mask_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-mask-2d"
+  us_image_root: ""
+  us_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d"
+  us_mask_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-mask-2d"
+  mr_train_coco_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d/train_sam3.json"
+  us_train_coco_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/train_sam3.json"
+  mr_val_coco_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d/val_sam3.json"
+  us_val_coco_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/val_sam3.json"
+  mr_test_coco_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d/test_sam3.json"
+  us_test_coco_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/test_sam3.json"
+  mr_train_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d/train_boxes_xyxy.json"
+  us_train_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/train_boxes_xyxy.json"
+  mr_val_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d/val_boxes_xyxy.json"
+  us_val_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/val_boxes_xyxy.json"
+  mr_test_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d/test_boxes_xyxy.json"
+  us_test_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/test_boxes_xyxy.json"
+  train_split: train
+  val_split: val
+  num_mr_patients: 210
+  num_us_patients: 210
+  patient_sampling:
+    mode: random
+    seed: 42
+    resample_each_epoch: false
+  patient_ids:
+    mr: []
+    us: []
+  # Validation selection is fixed for reproducible best-checkpoint comparison.
+  # null means all patients in the val split; explicit IDs take priority.
+  num_mr_val_patients: 35
+  num_us_val_patients: 35
+  val_patient_ids:
+    mr: []
+    us: []
+  val_patient_sampling:
+    mode: sequential
+    seed: 42
+  max_val_slices_per_patient: null
+  resample_patients_each_epoch: false
+  strict_dataset_check: true
+  return_format: sam3
+  selected_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/selected_patients.json
+  selected_val_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/selected_val_patients.json
+  area_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/area_thresholds.json
+  area_threshold_mode:
+    type: quantile
+    q1: 0.33
+    q2: 0.67
+    exclude_empty_masks: true
+    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/area_thresholds.json
+  boundary_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/boundary_thresholds.json
+  boundary_threshold_mode:
+    contrast_quantile: 0.33
+    complexity_quantile: 0.67
+    boundary_band_width: 3
+    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/boundary_thresholds.json
+
+loss:
+  lambda_sam3: 1.0
+  lambda_aux: 1.0
+  lambda_modality: 1.0
+  lambda_area: 1.0
+  lambda_area_reg: 0.2
+  lambda_boundary_router: 1.0
+  lambda_boundary_seg: 0.5
+  lambda_load_balance: 0.01
+  lambda_refine: 1.0
+  boundary_kernel_size: 3
+
+svanet:
+  enable: true
+  source_root: ../SvANet-main
+  checkpoint: ""
+  backbone_checkpoint: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/checkpoints/resnet50-11ad3fa6.pth
+  shared_across_modalities: true
+  mr_checkpoint: ""
+  us_checkpoint: ""
+  input_size: [512, 512]
+  roi_expand_ratio: 0.25
+  min_roi_size: 32
+  mask_threshold: 0.5
+  train_trigger:  gt
+  empty_mask_fallback: box_then_full_image
+  paste_mode: replace_roi
+  outside_roi: zero
+  use_gt_roi_for_warmup: true
+  gt_roi_warmup_epochs: 25
+
+optimizer:
+  shared_lora_lr: 0.00005
+  expert_lora_lr: 0.0001
+  router_lr: 0.0001
+  auxiliary_head_lr: 0.0001
+  svanet_lr: 0.00001
+  decoder_lr: 0.00001
+  weight_decay: 0.0001
+
+stages:
+  train_decoder_stage1: false
+  use_aux_loss_stage1: true
+  train_router_stage3: false
+  use_router_losses_stage3: false
+  train_shared_lora_stage5: false
+
+training:
+  stage: 2
+  epochs: 25
+  num_epochs: 25
+  batch_size: 8
+  num_workers: 4
+  learning_rate: 0.00005
+  weight_decay: 0.0001
+  data_dir: ""
+  amp: false
+  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3
+  resume: ""
+  log_interval: 10
+  validation_interval: 1
+  scheduler:
+    enabled: false
+    type: cosine
+    eta_min: 0.0
+
+output:
+  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3_v2
+wandb:
+  use_wandb: false
+  wandb_project: HMOE-SAM3
+  wandb_entity: null
+  wandb_name: null
+  wandb_group: null
+  wandb_tags: []
+  wandb_mode: online
+  wandb_dir: ./wandb
+  wandb_log_interval: 10
+  wandb_watch_model: false
+  wandb_resume: allow
+  wandb_run_id: null
