@@ -137,7 +137,13 @@ def extract_matched_masks(
 
 
 class HierarchicalMoELoss(nn.Module):
-    """Compose Step-6 losses; refinement is added in the SvANet step."""
+    """Compose staged losses around SAM3's native core loss.
+
+    ``sam3_core_loss`` must come directly from ``Sam3LossWrapper``.  It is
+    exposed as the ``sam3_loss`` component for stable configuration and metric
+    names, but is not recomputed here with the project's Dice+BCE helper.
+    Refinement is added separately in the SvANet step.
+    """
 
     def __init__(self, weights: Dict[str, float], boundary_kernel_size: int = 3) -> None:
         super().__init__()
@@ -146,6 +152,7 @@ class HierarchicalMoELoss(nn.Module):
 
     def forward(
         self,
+        sam3_core_loss: torch.Tensor,
         final_logits: torch.Tensor,
         gt_masks: torch.Tensor,
         aux_logits: Optional[torch.Tensor],
@@ -153,12 +160,17 @@ class HierarchicalMoELoss(nn.Module):
         routing_losses: Dict[str, torch.Tensor],
         area_ratio_gt: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if not torch.is_tensor(sam3_core_loss):
+            raise TypeError("sam3_core_loss must be a differentiable torch.Tensor")
+        if sam3_core_loss.numel() != 1:
+            raise ValueError(
+                "sam3_core_loss must be scalar, got "
+                f"shape={tuple(sam3_core_loss.shape)}"
+            )
         zero = routes["area_logits"].new_zeros(())
         if final_logits.shape[0] == 0:
-            sam3_loss = zero
             boundary_seg_loss = zero
         else:
-            sam3_loss = dice_bce_with_logits(final_logits, gt_masks)
             boundary_seg_loss = boundary_dice_loss(
                 final_logits, gt_masks, self.boundary_kernel_size
             )
@@ -174,7 +186,9 @@ class HierarchicalMoELoss(nn.Module):
             routes["area_ratio_pred"], area_ratio_gt
         )
         components = {
-            "sam3_loss": sam3_loss,
+            # Keep the existing public name while using the complete native
+            # SAM3 core loss (box, GIoU, classification/presence and masks).
+            "sam3_loss": sam3_core_loss,
             "aux_loss": aux_loss,
             "modality_loss": routing_losses["modality_loss"],
             "area_loss": routing_losses["area_loss"],

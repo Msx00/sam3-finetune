@@ -1173,7 +1173,11 @@ class SAM3TrainerNative:
             self.moe_controller.current_routes.get("coarse_mask_p3"),
         )
         routing_losses = self.moe_controller.routing_supervision_losses()
+        # Preserve SAM3's complete native objective.  HierarchicalMoELoss adds
+        # only the project-specific auxiliary/router/boundary terms around it;
+        # it must not replace core_loss with a second Dice+BCE mask objective.
         total_loss, components = self.moe_loss(
+            sam3_core_loss=total_loss,
             final_logits=final_logits,
             gt_masks=gt_masks,
             aux_logits=aux_logits,
