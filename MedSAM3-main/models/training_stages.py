@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Set
+import warnings
 
 import torch
 from torch import nn
@@ -94,7 +95,6 @@ class StageTrainingManager:
                 (f"svanet_adapter.{name}", parameter)
                 for name, parameter in self.svanet_adapter.named_parameters()
             ]
-        id_to_param = {id(parameter): parameter for _, parameter in all_named}
         group_ids = {
             "shared_lora": shared_ids,
             "expert_lora": expert_ids,
@@ -110,8 +110,37 @@ class StageTrainingManager:
             if overlap:
                 raise RuntimeError(f"Parameters assigned to multiple groups: {name}")
             claimed.update(ids)
-            groups[name] = [id_to_param[item] for item in ids if item in id_to_param]
+            # Preserve named_parameters() order. Iterating the ID set made the
+            # optimizer parameter order depend on process memory addresses, so
+            # Adam state could be attached to a different tensor after resume.
+            groups[name] = [
+                parameter
+                for _, parameter in all_named
+                if id(parameter) in ids
+            ]
         return groups
+
+    def optimizer_parameter_names(self, optimizer: AdamW) -> List[List[str]]:
+        """Return the stable parameter-name layout used by optimizer groups."""
+        all_named = list(self.model.named_parameters())
+        if self.svanet_adapter is not None:
+            all_named += [
+                (f"svanet_adapter.{name}", parameter)
+                for name, parameter in self.svanet_adapter.named_parameters()
+            ]
+        id_to_name = {id(parameter): name for name, parameter in all_named}
+        layout: List[List[str]] = []
+        for group in optimizer.param_groups:
+            names = []
+            for parameter in group["params"]:
+                name = id_to_name.get(id(parameter))
+                if name is None:
+                    raise RuntimeError(
+                        "Optimizer contains a parameter not owned by the stage manager"
+                    )
+                names.append(name)
+            layout.append(names)
+        return layout
 
     def trainable_group_names(self) -> Set[str]:
         policy = {
@@ -255,7 +284,7 @@ class StageTrainingManager:
             if id(parameter) in shared_names
         }
         payload = {
-            "format_version": 2,
+            "format_version": 3,
             "stage": self.stage,
             "stage_name": STAGE_NAMES[self.stage],
             "epoch": int(epoch),
@@ -273,6 +302,7 @@ class StageTrainingManager:
             "controller_state": self.controller.state_dict(),
             "svanet_state": None if self.svanet_adapter is None else self.svanet_adapter.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+            "optimizer_param_names": self.optimizer_parameter_names(optimizer),
             "scheduler_state": (
                 scheduler.state_dict() if scheduler is not None else None
             ),
@@ -337,15 +367,58 @@ class StageTrainingManager:
         path: str | Path,
         optimizer: AdamW,
         scheduler: Optional[object] = None,
+        restore_optimizer: bool = True,
     ) -> Dict[str, object]:
         payload = self.load_checkpoint(path, allowed_stages={self.stage})
-        if payload.get("optimizer_state"):
-            optimizer.load_state_dict(payload["optimizer_state"])
-        scheduler_state = payload.get("scheduler_state")
-        if scheduler is not None and scheduler_state:
-            scheduler.load_state_dict(scheduler_state)
-        elif scheduler_state and scheduler is None:
-            raise ValueError(
-                "Checkpoint contains scheduler state but scheduler is disabled"
+        optimizer_restored = False
+        optimizer_state = payload.get("optimizer_state")
+        saved_parameter_names = payload.get("optimizer_param_names")
+        if restore_optimizer and optimizer_state:
+            current_parameter_names = self.optimizer_parameter_names(optimizer)
+            if saved_parameter_names is None:
+                warnings.warn(
+                    "Checkpoint has no optimizer_param_names and was created by "
+                    "the legacy non-deterministic parameter grouping code; model "
+                    "and batch progress will be restored, but Adam state is reset.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif saved_parameter_names != current_parameter_names:
+                warnings.warn(
+                    "Checkpoint optimizer parameter layout differs from the current "
+                    "model; model and batch progress will be restored, but Adam "
+                    "state is reset.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                optimizer.load_state_dict(optimizer_state)
+                optimizer_restored = True
+        elif optimizer_state and not restore_optimizer:
+            warnings.warn(
+                "Optimizer restore is disabled; model and batch progress will be "
+                "restored with a fresh optimizer.",
+                RuntimeWarning,
+                stacklevel=2,
             )
+        scheduler_state = payload.get("scheduler_state")
+        if scheduler is not None and scheduler_state and optimizer_restored:
+            scheduler.load_state_dict(scheduler_state)
+        elif scheduler_state and not optimizer_restored:
+            warnings.warn(
+                "Scheduler state was not restored because optimizer state was reset.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        elif scheduler_state and scheduler is None:
+            warnings.warn(
+                "Checkpoint contains scheduler state but the current scheduler is "
+                "disabled; scheduler state was skipped.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        payload["optimizer_state_restored"] = optimizer_restored
+        payload["scheduler_state_restored"] = bool(
+            scheduler is not None and scheduler_state and optimizer_restored
+        )
         return payload

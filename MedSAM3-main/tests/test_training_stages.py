@@ -106,7 +106,7 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
                 "selected_patient_ids", "area_thresholds",
                 "boundary_thresholds", "config", "next_batch_index",
                 "global_step", "rng_state", "progress_state",
-                "checkpoint_kind",
+                "checkpoint_kind", "optimizer_param_names",
             }
             assert required <= payload.keys()
             assert payload["next_batch_index"] == 17
@@ -116,6 +116,7 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
             assert not path.with_suffix(path.suffix + ".tmp").exists()
             resumed = manager.resume(path, optimizer, scheduler)
             assert resumed["stage"] == 3
+            assert resumed["optimizer_state_restored"] is True
             try:
                 manager.load_checkpoint(path, allowed_stages={2})
                 raise AssertionError("stage mismatch was not rejected")

@@ -1105,7 +1105,12 @@ class SAM3TrainerNative:
             if self.stage_manager is None:
                 raise ValueError("Stage checkpoint resume is only available in MoE staged training")
             resumed = self.stage_manager.resume(
-                configured_resume, self.optimizer, self.scheduler
+                configured_resume,
+                self.optimizer,
+                self.scheduler,
+                restore_optimizer=bool(
+                    self.config.get("training", {}).get("resume_optimizer", True)
+                ),
             )
             self.start_epoch = int(resumed.get("epoch", 0))
             self.resume_batch_index = int(resumed.get("next_batch_index", 0))
@@ -1124,6 +1129,11 @@ class SAM3TrainerNative:
                 f"Resumed stage {self.training_stage} from {configured_resume} "
                 f"at epoch {self.start_epoch}, next batch {self.resume_batch_index}"
             )
+            if not resumed.get("optimizer_state_restored", False):
+                print_rank0(
+                    "WARNING: model and batch progress were restored, but the "
+                    "optimizer is starting with fresh Adam state"
+                )
         
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(

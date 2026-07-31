@@ -534,7 +534,7 @@ stageN_last.pt
 stage1_baseline_best.pt / stage2_router_best.pt / ... / stage5_joint_best.pt
 ```
 
-stage checkpoint 的 format version 为 2，包含 `model_state`、`router_state`、`expert_lora_state`、`shared_lora_state`、`controller_state`、可选 `svanet_state`、optimizer/scheduler state、patient IDs、阈值、配置、epoch 和 best metric。推理应加载完整 `stageN_*_best.pt`，而不是只含 adapter 的 `best_lora_weights.pt`。
+stage checkpoint 的 format version 为 3，包含 `model_state`、`router_state`、`expert_lora_state`、`shared_lora_state`、`controller_state`、可选 `svanet_state`、optimizer/scheduler state、optimizer 参数名布局、patient IDs、阈值、配置、epoch 和 best metric。推理应加载完整 `stageN_*_best.pt`，而不是只含 adapter 的 `best_lora_weights.pt`。旧版 checkpoint 没有稳定的 optimizer 参数名布局；恢复时会保留模型、epoch 和 batch 进度，但安全地重置 Adam 与 scheduler 状态，避免把动量张量加载到错误参数。
 
 `router_statistics.json` 是 JSON 数组，每个 epoch 记录 learning rates、各 loss、Router accuracy/entropy、teacher-forcing 比率、12 个专家计数、SvANet 触发/回退/ROI 统计以及分割指标。`val_stats.json` 是逐行 JSON，记录 `train_loss` 和 `val_loss`。
 
