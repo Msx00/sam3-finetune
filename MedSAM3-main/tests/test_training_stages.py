@@ -91,6 +91,11 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
                 area_thresholds={"small_max": 0.01},
                 boundary_thresholds={"mr": {"contrast_low": 0.2}},
                 config={"training": {"stage": 3}},
+                next_batch_index=17,
+                global_step=117,
+                rng_state={"torch": torch.get_rng_state()},
+                progress_state={"train_losses": [1.0, 0.5]},
+                checkpoint_kind="step",
             )
             assert path.is_file()
             payload = manager.load_checkpoint(path, allowed_stages={3})
@@ -99,9 +104,16 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
                 "shared_lora_state", "svanet_state", "optimizer_state",
                 "scheduler_state", "epoch", "stage", "best_metric",
                 "selected_patient_ids", "area_thresholds",
-                "boundary_thresholds", "config",
+                "boundary_thresholds", "config", "next_batch_index",
+                "global_step", "rng_state", "progress_state",
+                "checkpoint_kind",
             }
             assert required <= payload.keys()
+            assert payload["next_batch_index"] == 17
+            assert payload["global_step"] == 117
+            assert payload["progress_state"]["train_losses"] == [1.0, 0.5]
+            assert payload["checkpoint_kind"] == "step"
+            assert not path.with_suffix(path.suffix + ".tmp").exists()
             resumed = manager.resume(path, optimizer, scheduler)
             assert resumed["stage"] == 3
             try:

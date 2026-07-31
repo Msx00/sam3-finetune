@@ -175,6 +175,11 @@ training:
   save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct
   # Direct Stage 5 must not resume a Stage 4 checkpoint.
   resume: null
+  # Overwrite one complete checkpoint every N optimizer updates. Set to 0 to
+  # disable. Exact batch replay currently supports single-GPU training only.
+  checkpoint_interval_steps: 500
+  step_checkpoint_name: stage5_step_last.pt
+  data_order_seed: 42
   log_interval: 10
   validation_interval: 1
   scheduler:

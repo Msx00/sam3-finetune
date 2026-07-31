@@ -54,6 +54,40 @@ class EpochStatistics:
         self.svanet_batches = 0
         self.slice_records = []
 
+    def state_dict(self) -> Dict[str, Any]:
+        """Return a CPU-only, pickle-safe state for mid-epoch checkpoints."""
+        return {
+            "loss_sums": dict(self.loss_sums),
+            "loss_batches": int(self.loss_batches),
+            "loss_weight": int(self.loss_weight),
+            "router_correct": dict(self.router_correct),
+            "router_total": dict(self.router_total),
+            "entropy_sum": dict(self.entropy_sum),
+            "expert_counts": dict(self.expert_counts),
+            "teacher_used": int(self.teacher_used),
+            "teacher_total": int(self.teacher_total),
+            "svanet": dict(self.svanet),
+            "svanet_batches": int(self.svanet_batches),
+            "slice_records": list(self.slice_records),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore statistics accumulated before a mid-epoch interruption."""
+        self.loss_sums = defaultdict(float, state.get("loss_sums", {}))
+        self.loss_batches = int(state.get("loss_batches", 0))
+        self.loss_weight = int(state.get("loss_weight", 0))
+        self.router_correct = defaultdict(int, state.get("router_correct", {}))
+        self.router_total = defaultdict(int, state.get("router_total", {}))
+        self.entropy_sum = defaultdict(float, state.get("entropy_sum", {}))
+        restored_experts = dict(state.get("expert_counts", {}))
+        for name in self.expert_counts:
+            self.expert_counts[name] = int(restored_experts.get(name, 0))
+        self.teacher_used = int(state.get("teacher_used", 0))
+        self.teacher_total = int(state.get("teacher_total", 0))
+        self.svanet = defaultdict(float, state.get("svanet", {}))
+        self.svanet_batches = int(state.get("svanet_batches", 0))
+        self.slice_records = list(state.get("slice_records", []))
+
     def update_losses(self, components: Mapping[str, Any], weight: int = 1) -> None:
         """Accumulate batch-mean losses weighted by the effective batch size."""
         weight = max(int(weight), 1)

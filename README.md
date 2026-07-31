@@ -460,6 +460,36 @@ python train_moe_sam3.py \
   --device 0
 ```
 
+若要从一个 epoch 内的 batch 继续，在配置的 `training` 下启用 step checkpoint：
+
+```yaml
+training:
+  num_workers: 0
+  checkpoint_interval_steps: 500
+  step_checkpoint_name: stage5_step_last.pt
+  data_order_seed: 42
+```
+
+训练每完成 500 次 optimizer update，就会原子覆盖保存一个完整的
+`output.output_dir/stage5_step_last.pt`。中断后使用该文件恢复：
+
+```bash
+python train_moe_sam3.py \
+  --config configs/moe_sam3_stage5_direct.yaml \
+  --stage 5 \
+  --resume /path/to/output/stage5_step_last.pt \
+  --device 0
+```
+
+step checkpoint 会恢复同一 epoch、从已完成 batch 的下一个 batch 开始，并恢复
+optimizer、scheduler、global step、随机数状态以及本 epoch 已累计的 loss/指标。当前
+batch 级恢复只支持单 GPU；为保证随机数据增强也能精确重放，应使用
+`training.num_workers: 0`，并保持数据集、batch size 和 `data_order_seed` 不变。
+恢复采样器会直接从目标 batch 的样本索引开始，不会重新读取和预处理此前已经完成
+的 batch。
+`checkpoint_interval_steps` 越小，意外中断时需要重算的 batch 越少，但完整 Stage 5
+checkpoint 较大，保存过于频繁会明显降低训练速度。设为 `0` 可关闭此功能。
+
 已实现的 scheduler 类型为 `cosine` 和 `step`；由 `training.scheduler.enabled` 启用，每个 epoch 后执行一次 `step()`。
 
 ### 6.4 原始 SAM3 + LoRA

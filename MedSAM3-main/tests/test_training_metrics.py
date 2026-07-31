@@ -57,3 +57,30 @@ def test_patient_macro_does_not_weight_patients_by_slice_count():
     report = statistics.segmentation_report()
     assert abs(report["slice_dice"] - 2 / 3) < 1e-8
     assert abs(report["patient_macro_dice"] - 0.75) < 1e-8
+
+
+def test_epoch_statistics_mid_epoch_state_round_trip():
+    original = EpochStatistics()
+    original.update_losses({"total_loss": torch.tensor(2.0)}, weight=3)
+    original.teacher_used = 2
+    original.teacher_total = 3
+    original.slice_records.append({
+        "patient_id": 7,
+        "modality": "MR",
+        "area_label": 0,
+        "boundary_label": 1,
+        "base_dice": 0.5,
+        "base_iou": 1 / 3,
+        "final_dice": 0.75,
+        "final_iou": 0.6,
+    })
+
+    restored = EpochStatistics()
+    restored.load_state_dict(original.state_dict())
+
+    assert restored.loss_sums == original.loss_sums
+    assert restored.loss_weight == 3
+    assert restored.teacher_used == 2
+    assert restored.teacher_total == 3
+    assert restored.slice_records == original.slice_records
+    assert restored.report(0.0) == original.report(0.0)

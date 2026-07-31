@@ -238,6 +238,11 @@ class StageTrainingManager:
         area_thresholds: Optional[Mapping[str, object]] = None,
         boundary_thresholds: Optional[Mapping[str, object]] = None,
         config: Optional[Mapping[str, object]] = None,
+        next_batch_index: int = 0,
+        global_step: Optional[int] = None,
+        rng_state: Optional[Mapping[str, object]] = None,
+        progress_state: Optional[Mapping[str, object]] = None,
+        checkpoint_kind: str = "epoch",
     ) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,6 +259,11 @@ class StageTrainingManager:
             "stage": self.stage,
             "stage_name": STAGE_NAMES[self.stage],
             "epoch": int(epoch),
+            "next_batch_index": int(next_batch_index),
+            "global_step": None if global_step is None else int(global_step),
+            "rng_state": dict(rng_state or {}),
+            "progress_state": dict(progress_state or {}),
+            "checkpoint_kind": str(checkpoint_kind),
             "best_metric": float(best_loss),
             "best_loss": float(best_loss),
             "model_state": self.model.state_dict(),
@@ -271,7 +281,11 @@ class StageTrainingManager:
             "boundary_thresholds": dict(boundary_thresholds or {}),
             "config": dict(config or {}),
         }
-        torch.save(payload, path)
+        # Keep the previous usable checkpoint until the new file has been
+        # written completely. This matters for multi-GB Stage-5 checkpoints.
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, temp_path)
+        temp_path.replace(path)
 
     def load_checkpoint(
         self, path: str | Path, allowed_stages: Optional[Iterable[int]] = None
