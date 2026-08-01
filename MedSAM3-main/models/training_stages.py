@@ -272,6 +272,7 @@ class StageTrainingManager:
         rng_state: Optional[Mapping[str, object]] = None,
         progress_state: Optional[Mapping[str, object]] = None,
         checkpoint_kind: str = "epoch",
+        world_size: int = 1,
     ) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -284,7 +285,7 @@ class StageTrainingManager:
             if id(parameter) in shared_names
         }
         payload = {
-            "format_version": 3,
+            "format_version": 4,
             "stage": self.stage,
             "stage_name": STAGE_NAMES[self.stage],
             "epoch": int(epoch),
@@ -293,6 +294,7 @@ class StageTrainingManager:
             "rng_state": dict(rng_state or {}),
             "progress_state": dict(progress_state or {}),
             "checkpoint_kind": str(checkpoint_kind),
+            "world_size": int(world_size),
             "best_metric": float(best_loss),
             "best_loss": float(best_loss),
             "model_state": self.model.state_dict(),

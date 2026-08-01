@@ -52,6 +52,10 @@ from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
 from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
+from models.resumable_batch_sampler import (
+    ResumableDistributedBatchSampler,
+    ResumableRandomBatchSampler,
+)
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
@@ -107,50 +111,6 @@ def print_rank0(*args, **kwargs):
     """Print only on rank 0."""
     if is_main_process():
         print(*args, **kwargs)
-
-
-class ResumableRandomBatchSampler:
-    """Deterministic shuffled batches that can start at an epoch batch offset."""
-
-    def __init__(self, dataset_size, batch_size, seed):
-        self.dataset_size = int(dataset_size)
-        self.batch_size = int(batch_size)
-        self.seed = int(seed)
-        self.epoch = 0
-        self.start_batch = 0
-        if self.dataset_size < 0:
-            raise ValueError("dataset_size must be non-negative")
-        if self.batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-
-    @property
-    def total_batches(self):
-        return (self.dataset_size + self.batch_size - 1) // self.batch_size
-
-    def set_epoch(self, epoch, start_batch=0):
-        start_batch = int(start_batch)
-        if start_batch < 0 or start_batch > self.total_batches:
-            raise ValueError(
-                f"start_batch={start_batch} is outside [0, {self.total_batches}]"
-            )
-        self.epoch = int(epoch)
-        self.start_batch = start_batch
-
-    def __iter__(self):
-        generator = torch.Generator()
-        generator.manual_seed(self.seed + self.epoch)
-        indices = torch.randperm(
-            self.dataset_size, generator=generator
-        ).tolist()
-        for offset in range(
-            self.start_batch * self.batch_size,
-            self.dataset_size,
-            self.batch_size,
-        ):
-            yield indices[offset:offset + self.batch_size]
-
-    def __len__(self):
-        return self.total_batches - self.start_batch
 
 
 class COCOSegmentDataset(Dataset):
@@ -846,6 +806,9 @@ class SAM3TrainerNative:
         self.resume_batch_index = 0
         self.resume_rng_state = None
         self.resume_progress_state = {}
+        self.resume_checkpoint_world_size = 1
+        self.resume_checkpoint_config = {}
+        self.resume_selected_patient_ids = {}
         self.resumed_global_step = None
         self.resume_best_metric = float("inf")
         self.resume_path = resume_path
@@ -1116,10 +1079,26 @@ class SAM3TrainerNative:
             self.resume_batch_index = int(resumed.get("next_batch_index", 0))
             if self.resume_batch_index < 0:
                 raise ValueError("Checkpoint next_batch_index must be non-negative")
+            self.resume_checkpoint_world_size = int(resumed.get("world_size", 1))
+            if (
+                self.resume_batch_index
+                and self.resume_checkpoint_world_size != self.world_size
+            ):
+                raise ValueError(
+                    "Mid-epoch resume requires the same GPU world size as the "
+                    f"checkpoint: checkpoint={self.resume_checkpoint_world_size}, "
+                    f"current={self.world_size}"
+                )
             if self.resume_batch_index:
-                self.resume_rng_state = resumed.get("rng_state") or None
-                self.resume_progress_state = dict(
-                    resumed.get("progress_state") or {}
+                self.resume_checkpoint_config = dict(resumed.get("config") or {})
+                self.resume_selected_patient_ids = dict(
+                    resumed.get("selected_patient_ids") or {}
+                )
+                self.resume_rng_state = self._rank_checkpoint_state(
+                    resumed.get("rng_state"), "rng_state"
+                )
+                self.resume_progress_state = self._rank_checkpoint_state(
+                    resumed.get("progress_state"), "progress_state"
                 )
             self.resumed_global_step = resumed.get("global_step")
             self.resume_best_metric = float(
@@ -1127,7 +1106,8 @@ class SAM3TrainerNative:
             )
             print_rank0(
                 f"Resumed stage {self.training_stage} from {configured_resume} "
-                f"at epoch {self.start_epoch}, next batch {self.resume_batch_index}"
+                f"at epoch {self.start_epoch}, next batch {self.resume_batch_index}, "
+                f"checkpoint world size {self.resume_checkpoint_world_size}"
             )
             if not resumed.get("optimizer_state_restored", False):
                 print_rank0(
@@ -1425,6 +1405,32 @@ class SAM3TrainerNative:
                 [value.cpu() for value in state["cuda"]]
             )
 
+    def _rank_checkpoint_state(self, state, state_name):
+        """Select this rank's state from new DDP or legacy single-rank data."""
+        if not state:
+            return {} if state_name == "progress_state" else None
+        if isinstance(state, dict) and "per_rank" in state:
+            per_rank = state.get("per_rank") or []
+            if len(per_rank) != self.resume_checkpoint_world_size:
+                raise ValueError(
+                    f"Checkpoint {state_name} contains {len(per_rank)} rank states, "
+                    f"expected {self.resume_checkpoint_world_size}"
+                )
+            return per_rank[get_rank()]
+        if self.resume_checkpoint_world_size != 1:
+            raise ValueError(
+                f"Distributed checkpoint is missing per-rank {state_name}"
+            )
+        return state
+
+    def _gather_rank_states(self, local_state):
+        """Gather small Python checkpoint state from every rank onto rank 0."""
+        if not self.multi_gpu:
+            return [local_state]
+        gathered = [None] * self.world_size if is_main_process() else None
+        dist.gather_object(local_state, gathered, dst=0)
+        return gathered
+
     def _save_stage_checkpoint(
         self,
         out_dir,
@@ -1435,6 +1441,7 @@ class SAM3TrainerNative:
         next_batch_index=0,
         progress_state=None,
         checkpoint_kind="epoch",
+        rng_state=None,
     ):
         if self.stage_manager is None:
             return
@@ -1457,10 +1464,17 @@ class SAM3TrainerNative:
             next_batch_index=next_batch_index,
             global_step=self.global_step,
             rng_state=(
-                self._capture_rng_state() if checkpoint_kind == "step" else None
+                rng_state
+                if rng_state is not None
+                else (
+                    self._capture_rng_state()
+                    if checkpoint_kind == "step"
+                    else None
+                )
             ),
             progress_state=progress_state,
             checkpoint_kind=checkpoint_kind,
+            world_size=self.world_size,
         )
 
     def _selected_patient_state(self):
@@ -1795,10 +1809,6 @@ class SAM3TrainerNative:
         )
         if checkpoint_interval_steps < 0:
             raise ValueError("training.checkpoint_interval_steps must be non-negative")
-        if (checkpoint_interval_steps or self.resume_batch_index) and self.multi_gpu:
-            raise ValueError(
-                "Mid-epoch checkpointing currently supports single-GPU training only"
-            )
         step_checkpoint_name = str(
             training_config.get(
                 "step_checkpoint_name", f"stage{self.training_stage}_step_last.pt"
@@ -1814,6 +1824,38 @@ class SAM3TrainerNative:
                 ),
             )
         )
+        if self.resume_batch_index:
+            saved_training = dict(
+                self.resume_checkpoint_config.get("training") or {}
+            )
+            saved_batch_size = saved_training.get("batch_size")
+            current_batch_size = int(training_config["batch_size"])
+            if (
+                saved_batch_size is not None
+                and int(saved_batch_size) != current_batch_size
+            ):
+                raise ValueError(
+                    "Mid-epoch resume requires the same per-GPU batch_size: "
+                    f"checkpoint={saved_batch_size}, current={current_batch_size}"
+                )
+            saved_data_order_seed = saved_training.get("data_order_seed")
+            if (
+                saved_data_order_seed is not None
+                and int(saved_data_order_seed) != data_order_seed
+            ):
+                raise ValueError(
+                    "Mid-epoch resume requires the same data_order_seed: "
+                    f"checkpoint={saved_data_order_seed}, current={data_order_seed}"
+                )
+            current_patient_ids = self._selected_patient_state()
+            if (
+                self.resume_selected_patient_ids
+                and self.resume_selected_patient_ids != current_patient_ids
+            ):
+                raise ValueError(
+                    "Mid-epoch resume requires the same selected patient IDs as "
+                    "the checkpoint"
+                )
         deterministic_step_resume = bool(
             checkpoint_interval_steps or self.resume_batch_index
         )
@@ -1825,7 +1867,8 @@ class SAM3TrainerNative:
                 train_ds,
                 num_replicas=self.world_size,
                 rank=get_rank(),
-                shuffle=True
+                shuffle=True,
+                seed=data_order_seed,
             )
             if has_validation:
                 val_sampler = DistributedSampler(
@@ -1843,11 +1886,17 @@ class SAM3TrainerNative:
             "generator": train_generator,
         }
         if deterministic_step_resume:
-            resumable_batch_sampler = ResumableRandomBatchSampler(
-                dataset_size=len(train_ds),
-                batch_size=self.config["training"]["batch_size"],
-                seed=data_order_seed,
-            )
+            if train_sampler is not None:
+                resumable_batch_sampler = ResumableDistributedBatchSampler(
+                    sampler=train_sampler,
+                    batch_size=self.config["training"]["batch_size"],
+                )
+            else:
+                resumable_batch_sampler = ResumableRandomBatchSampler(
+                    dataset_size=len(train_ds),
+                    batch_size=self.config["training"]["batch_size"],
+                    seed=data_order_seed,
+                )
             train_loader = DataLoader(
                 batch_sampler=resumable_batch_sampler,
                 **loader_kwargs,
@@ -1987,9 +2036,7 @@ class SAM3TrainerNative:
                     )
             self._log_patient_selection(epoch)
             # Set epoch for distributed sampler (required for proper shuffling)
-            if self.multi_gpu and train_sampler is not None:
-                train_sampler.set_epoch(epoch)
-            elif resumable_batch_sampler is not None:
+            if resumable_batch_sampler is not None:
                 resumable_batch_sampler.set_epoch(
                     epoch,
                     start_batch=(
@@ -2001,6 +2048,8 @@ class SAM3TrainerNative:
                 # Keep DataLoader worker seeding deterministic and independent
                 # from the sampler's own generator.
                 train_generator.manual_seed(data_order_seed + epoch)
+            elif self.multi_gpu and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
             # Track training losses for this epoch
             train_losses = []
@@ -2234,28 +2283,43 @@ class SAM3TrainerNative:
                     checkpoint_interval_steps
                     and self.global_step % checkpoint_interval_steps == 0
                 ):
-                    progress_state = {
+                    local_progress_state = {
                         "train_losses": list(train_losses),
                         "train_statistics": train_statistics.state_dict(),
                         "teacher_counts": {
                             name: list(values) for name, values in teacher_counts.items()
                         },
                     }
-                    self._save_stage_checkpoint(
-                        out_dir,
-                        epoch=epoch,
-                        # Preserve the best completed validation metric. The
-                        # current batch losses are stored in progress_state.
-                        loss=best_val_loss,
-                        checkpoint_name=step_checkpoint_name,
-                        next_batch_index=batch_index + 1,
-                        progress_state=progress_state,
-                        checkpoint_kind="step",
+                    rank_rng_states = self._gather_rank_states(
+                        self._capture_rng_state()
                     )
-                    print_rank0(
-                        f"Saved mid-epoch checkpoint at epoch {epoch + 1}, "
-                        f"next batch {batch_index + 1}: {out_dir / step_checkpoint_name}"
+                    rank_progress_states = self._gather_rank_states(
+                        local_progress_state
                     )
+                    if is_main_process():
+                        self._save_stage_checkpoint(
+                            out_dir,
+                            epoch=epoch,
+                            # Preserve the best completed validation metric. The
+                            # current batch losses are stored in progress_state.
+                            loss=best_val_loss,
+                            checkpoint_name=step_checkpoint_name,
+                            next_batch_index=batch_index + 1,
+                            progress_state={
+                                "per_rank": rank_progress_states,
+                            },
+                            checkpoint_kind="step",
+                            rng_state={"per_rank": rank_rng_states},
+                        )
+                        print_rank0(
+                            f"Saved mid-epoch checkpoint at epoch {epoch + 1}, "
+                            f"next batch {batch_index + 1}: "
+                            f"{out_dir / step_checkpoint_name}"
+                        )
+                    if self.multi_gpu:
+                        # Non-zero ranks wait while rank 0 atomically writes the
+                        # full checkpoint, then all ranks resume together.
+                        dist.barrier()
 
             self.resume_batch_index = 0
             self.resume_progress_state = {}

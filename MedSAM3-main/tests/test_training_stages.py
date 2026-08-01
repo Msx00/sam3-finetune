@@ -106,13 +106,14 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
                 "selected_patient_ids", "area_thresholds",
                 "boundary_thresholds", "config", "next_batch_index",
                 "global_step", "rng_state", "progress_state",
-                "checkpoint_kind", "optimizer_param_names",
+                "checkpoint_kind", "optimizer_param_names", "world_size",
             }
             assert required <= payload.keys()
             assert payload["next_batch_index"] == 17
             assert payload["global_step"] == 117
             assert payload["progress_state"]["train_losses"] == [1.0, 0.5]
             assert payload["checkpoint_kind"] == "step"
+            assert payload["world_size"] == 1
             assert not path.with_suffix(path.suffix + ".tmp").exists()
             resumed = manager.resume(path, optimizer, scheduler)
             assert resumed["stage"] == 3

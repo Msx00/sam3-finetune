@@ -179,7 +179,7 @@ training:
   # model/batch progress is restored while incompatible Adam state is reset.
   resume_optimizer: true
   # Overwrite one complete checkpoint every N optimizer updates. Set to 0 to
-  # disable. Exact batch replay currently supports single-GPU training only.
+  # disable. Mid-epoch DDP resume requires the same GPU count as the checkpoint.
   checkpoint_interval_steps: 500
   step_checkpoint_name: stage5_step_last.pt
   data_order_seed: 42

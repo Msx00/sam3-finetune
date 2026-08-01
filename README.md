@@ -481,10 +481,21 @@ python train_moe_sam3.py \
   --device 0
 ```
 
+双 GPU 训练产生的 step checkpoint 使用相同方式恢复，但必须仍传入两张 GPU：
+
+```bash
+python train_moe_sam3.py \
+  --config configs/moe_sam3_stage5_direct.yaml \
+  --stage 5 \
+  --resume /path/to/output/stage5_step_last.pt \
+  --device 0 1
+```
+
 step checkpoint 会恢复同一 epoch、从已完成 batch 的下一个 batch 开始，并恢复
-optimizer、scheduler、global step、随机数状态以及本 epoch 已累计的 loss/指标。当前
-batch 级恢复只支持单 GPU；为保证随机数据增强也能精确重放，应使用
-`training.num_workers: 0`，并保持数据集、batch size 和 `data_order_seed` 不变。
+optimizer、scheduler、global step、各 DDP rank 的随机数状态以及本 epoch 已累计的
+loss/指标。单 GPU和多 GPU 均支持 batch 级恢复；多 GPU 恢复必须使用与保存时相同的
+GPU 数量。为保证随机数据增强也能精确重放，应使用 `training.num_workers: 0`，并保持
+数据集、每卡 batch size 和 `data_order_seed` 不变。
 恢复采样器会直接从目标 batch 的样本索引开始，不会重新读取和预处理此前已经完成
 的 batch。
 `checkpoint_interval_steps` 越小，意外中断时需要重算的 batch 越少，但完整 Stage 5
@@ -534,7 +545,7 @@ stageN_last.pt
 stage1_baseline_best.pt / stage2_router_best.pt / ... / stage5_joint_best.pt
 ```
 
-stage checkpoint 的 format version 为 3，包含 `model_state`、`router_state`、`expert_lora_state`、`shared_lora_state`、`controller_state`、可选 `svanet_state`、optimizer/scheduler state、optimizer 参数名布局、patient IDs、阈值、配置、epoch 和 best metric。推理应加载完整 `stageN_*_best.pt`，而不是只含 adapter 的 `best_lora_weights.pt`。旧版 checkpoint 没有稳定的 optimizer 参数名布局；恢复时会保留模型、epoch 和 batch 进度，但安全地重置 Adam 与 scheduler 状态，避免把动量张量加载到错误参数。
+stage checkpoint 的 format version 为 4，包含 `model_state`、`router_state`、`expert_lora_state`、`shared_lora_state`、`controller_state`、可选 `svanet_state`、optimizer/scheduler state、optimizer 参数名布局、DDP world size、patient IDs、阈值、配置、epoch 和 best metric。推理应加载完整 `stageN_*_best.pt`，而不是只含 adapter 的 `best_lora_weights.pt`。旧版 checkpoint 没有稳定的 optimizer 参数名布局；恢复时会保留模型、epoch 和 batch 进度，但安全地重置 Adam 与 scheduler 状态，避免把动量张量加载到错误参数。
 
 `router_statistics.json` 是 JSON 数组，每个 epoch 记录 learning rates、各 loss、Router accuracy/entropy、teacher-forcing 比率、12 个专家计数、SvANet 触发/回退/ROI 统计以及分割指标。`val_stats.json` 是逐行 JSON，记录 `train_loss` 和 `val_loss`。
 
