@@ -5,6 +5,7 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 """
 
 import numpy as np
+import os
 import torch
 
 from sam3.model.box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
@@ -15,6 +16,26 @@ from torch import nn
 def _do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):
     if repeats > 1:
         cost = np.tile(cost, (1, repeats))
+    if not np.isfinite(cost).all():
+        invalid_count = int((~np.isfinite(cost)).sum())
+        if os.environ.get("SAM3_MATCHER_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            finite = cost[np.isfinite(cost)]
+            finite_min = float(finite.min()) if finite.size else float("nan")
+            finite_max = float(finite.max()) if finite.size else float("nan")
+            print(
+                "[MATCHER-DEBUG] non-finite cost entries detected: "
+                f"invalid={invalid_count}, shape={cost.shape}, "
+                f"finite_min={finite_min:.6g}, finite_max={finite_max:.6g}",
+                flush=True,
+            )
+        # SciPy's linear_sum_assignment rejects NaN/Inf. Treat invalid
+        # entries as very high-cost matches so a single unstable prediction
+        # candidate does not terminate the whole training run.
+        cost = np.nan_to_num(cost, nan=1e9, posinf=1e9, neginf=1e9)
 
     i, j = linear_sum_assignment(cost)
     if do_filtering:
