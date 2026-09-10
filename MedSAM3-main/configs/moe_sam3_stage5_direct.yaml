@@ -37,22 +37,69 @@ moe:
   router_hidden_dim: 256
   routing_mode: top1
   temperature: 1.0
+  # True HMoE: modality is the parent and each modality owns conditional
+  # area/boundary child distributions.
+  conditional_hierarchy: true
+  use_image_locator: true
+  locator_hidden_dim: 128
+  # Route strictly from the visual FPN tensor captured before SAM3 fuses any
+  # text/geometry prompt. ``decoder_memory`` exists only as a legacy ablation.
+  routing_feature_source: backbone_fpn
+  # Confidence controller: uncertain samples stay on the shared SAM3/LoRA path;
+  # medium-confidence samples blend top-2 experts, high-confidence samples top-1.
+  confidence_routing: true
+  confidence_low_threshold: 0.35
+  confidence_high_threshold: 0.70
+  confidence_top_k: 2
+  confidence_fallback: shared
+  router_regularizer: batch_prior
+  residual_scale_init: 0.1
+  residual_scale_max: 1.0
+  learnable_residual_scale: true
 
 router:
   routing_type: top1
   modality_hidden_dim: 256
   area_hidden_dim: 256
   boundary_hidden_dim: 256
+  router_source_layer: 3
   use_gt_modality_during_train: true
   use_gt_area_during_warmup: true
   use_gt_boundary_during_warmup: true
   teacher_forcing:
     enabled: true
-    start_ratio: 1.0
+    start_ratio: 0.5
     end_ratio: 0.0
-    decay_epochs: 20
+    decay_epochs: 10
 
 dataset:
+  # Training-only XYXY box perturbation. Std is relative to box width/height;
+  # each coordinate offset is then clipped to this many pixels.
+  box_noise_std: 0.1
+  box_noise_max: 10
+  # The public input remains a slice.  "image_only" uses only the fixed,
+  # task-level word below internally and never uses a sample-specific GT box.
+  # The schedule removes accurate boxes and emphasizes deployment conditions.
+  prompt_curriculum:
+    enabled: true
+    fixed_text: prostate
+    seed: 42
+    decay_epochs: 20
+    evaluation_mode: image_only
+    start_probabilities:
+      image_only: 0.30
+      text: 0.10
+      coarse_box: 0.40
+      accurate_box: 0.20
+    end_probabilities:
+      image_only: 0.70
+      text: 0.10
+      coarse_box: 0.20
+      accurate_box: 0.00
+    coarse_box_expand_min: 0.15
+    coarse_box_expand_max: 0.45
+    coarse_box_jitter_std: 0.10
+    coarse_box_jitter_max: 20
   mr_image_root: ""
   mr_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d"
   mr_mask_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-mask-2d"
@@ -73,8 +120,8 @@ dataset:
   us_test_boxes_json: "/mnt/afs/zhemin/ShixingMa/dataset/seg/us-2d/test_boxes_xyxy.json"
   train_split: train
   val_split: val
-  num_mr_patients: 50
-  num_us_patients: 50
+  num_mr_patients: 210
+  num_us_patients: 210
   patient_sampling:
     mode: random
     seed: 42
@@ -94,27 +141,28 @@ dataset:
   resample_patients_each_epoch: false
   strict_dataset_check: true
   return_format: sam3
-  selected_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/selected_patients.json
-  selected_val_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/selected_val_patients.json
-  area_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/area_thresholds.json
+  selected_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct_gpu3/selected_patients.json
+  selected_val_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct_gpu3/selected_val_patients.json
+  area_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/area_thresholds.json
   area_threshold_mode:
     type: quantile
     q1: 0.33
     q2: 0.67
     exclude_empty_masks: true
-    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/area_thresholds.json
-  boundary_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/boundary_thresholds.json
+    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/area_thresholds.json
+  boundary_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/boundary_thresholds.json
   boundary_threshold_mode:
     contrast_quantile: 0.33
     complexity_quantile: 0.67
     boundary_band_width: 3
-    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/boundary_thresholds.json
+    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/boundary_thresholds.json
 
 loss:
   # Scales the complete native Sam3LossWrapper core loss (classification/
   # presence, box L1/GIoU, native mask focal and mask Dice).
   lambda_sam3: 1.0
   lambda_aux: 1.0
+  lambda_locator: 0.5
   lambda_modality: 1.0
   lambda_area: 1.0
   lambda_area_reg: 0.2
@@ -136,12 +184,28 @@ svanet:
   roi_expand_ratio: 0.25
   min_roi_size: 32
   mask_threshold: 0.5
-  train_trigger: gt
-  empty_mask_fallback: box_then_full_image
-  paste_mode: replace_roi
-  outside_roi: zero
-  use_gt_roi_for_warmup: true
-  gt_roi_warmup_epochs: 25
+  train_trigger: teacher_forcing
+  empty_mask_fallback: locator_then_box_then_skip
+  paste_mode: blend_with_sam3
+  outside_roi: sam3
+  fusion_weight: 0.35
+  residual_scale: 0.25
+  sam3_min_confidence: 0.55
+  locator_threshold: 0.5
+  locator_min_confidence: 0.55
+  min_component_pixels: 16
+  max_component_fraction: 0.8
+  min_area_confidence: 0.45
+  confidence_gate_during_training: false
+  # GT masks only bootstrap ROI selection early; training reaches the exact
+  # predicted-ROI inference path after epoch 10.
+  roi_teacher_forcing:
+    enabled: true
+    start_ratio: 0.5
+    end_ratio: 0.0
+    decay_epochs: 10
+  use_gt_roi_for_warmup: false
+  gt_roi_warmup_epochs: 0
 
 optimizer:
   # Conservative learning rates for direct, non-staged joint training.
@@ -149,7 +213,7 @@ optimizer:
   expert_lora_lr: 0.00001
   router_lr: 0.00001
   auxiliary_head_lr: 0.00001
-  svanet_lr: 0.00001
+  svanet_lr: 0.000001
   decoder_lr: 0.000001
   weight_decay: 0.0001
 
@@ -163,16 +227,22 @@ stages:
 
 training:
   stage: 5
-  # Run three epochs first; extend only after checking stability and validation.
-  epochs: 3
-  num_epochs: 3
-  batch_size: 4
+  # All model, routing, NumPy and Python RNGs use this seed. Ablation configs
+  # override it per repeat while keeping the data-order seed paired.
+  seed: 42
+  deterministic: true
+  deterministic_warn_only: true
+  cudnn_benchmark: false
+  # Full direct Stage-5 schedule; validation remains patient-disjoint.
+  epochs: 100
+  num_epochs: 100
+  batch_size: 8
   num_workers: 0
   learning_rate: 0.00001
   weight_decay: 0.0001
   data_dir: ""
   amp: false
-  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct
+  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct_noise
   # Direct Stage 5 must not resume a Stage 4 checkpoint.
   resume: null
   # Legacy checkpoints did not store stable optimizer parameter names. Their
@@ -191,14 +261,14 @@ training:
     eta_min: 0.0
 
 output:
-  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct
+  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct_noise
 
 wandb:
   use_wandb: true
   wandb_project: HMOE-SAM3
   wandb_entity: null
-  wandb_name: stage5-direct
-  wandb_group: direct-stage5
+  wandb_name: stage5-direct_noise
+  wandb_group: direct-stage5-noise
   wandb_tags:
     - stage5
     - direct-training
@@ -206,8 +276,8 @@ wandb:
     - sam3
     - svanet
   wandb_mode: online
-  wandb_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/wandb
+  wandb_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct_noise/wandb
   wandb_log_interval: 10
   wandb_watch_model: false
   wandb_resume: allow
-  wandb_run_id: null
+  wandb_run_id: new

@@ -1,4 +1,10 @@
-"""ROI adapter that uses the original, structurally unchanged SvANet."""
+"""Safe ROI refinement with the original, structurally unchanged SvANet.
+
+The adapter deliberately keeps ROI proposal and logit fusion outside SvANet:
+SvANet still receives an ordinary image crop and its architecture is untouched.
+This module only decides whether a crop is reliable enough to refine and how to
+merge the resulting foreground logits with SAM3.
+"""
 
 from __future__ import annotations
 
@@ -146,6 +152,70 @@ def largest_component_bbox(mask: torch.Tensor) -> Optional[Tuple[int, int, int, 
     return int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)
 
 
+def _largest_component_candidate(
+    probabilities: torch.Tensor,
+    threshold: float,
+    min_confidence: float,
+    min_component_pixels: int,
+    max_component_fraction: float,
+) -> Tuple[Optional[Tuple[int, int, int, int]], Dict[str, Any]]:
+    """Return a bbox only when the largest foreground component is reliable.
+
+    ``min_confidence`` is the mean foreground probability inside the selected
+    component.  Pixel-count and image-fraction guards reject isolated spikes and
+    degenerate almost-full-image predictions, respectively.  Selection is a
+    non-differentiable control decision by design, so it is evaluated on CPU.
+    """
+    if probabilities.ndim != 2:
+        raise ValueError(
+            "ROI proposal probabilities must be [H,W], got "
+            f"{tuple(probabilities.shape)}"
+        )
+    probability_array = (
+        probabilities.detach().to(device="cpu", dtype=torch.float32).numpy()
+    )
+    foreground = probability_array > float(threshold)
+    labels, count = ndimage.label(
+        foreground, structure=np.ones((3, 3), dtype=np.uint8)
+    )
+    stats: Dict[str, Any] = {
+        "confidence": 0.0,
+        "component_pixels": 0,
+        "component_fraction": 0.0,
+        "reason": "empty",
+    }
+    if count == 0:
+        return None, stats
+
+    sizes = np.bincount(labels.reshape(-1))
+    sizes[0] = 0
+    component_id = int(sizes.argmax())
+    selected = labels == component_id
+    pixels = int(selected.sum())
+    fraction = float(pixels / max(1, selected.size))
+    confidence = float(probability_array[selected].mean())
+    stats.update(
+        confidence=confidence,
+        component_pixels=pixels,
+        component_fraction=fraction,
+    )
+    if pixels < int(min_component_pixels):
+        stats["reason"] = "too_small"
+        return None, stats
+    if fraction > float(max_component_fraction):
+        stats["reason"] = "too_large"
+        return None, stats
+    if confidence < float(min_confidence):
+        stats["reason"] = "low_confidence"
+        return None, stats
+
+    ys, xs = np.nonzero(selected)
+    stats["reason"] = "accepted"
+    return (
+        int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)
+    ), stats
+
+
 def expand_and_clip_roi(
     box: Sequence[float],
     image_height: int,
@@ -208,7 +278,26 @@ def select_small_triggers(
 
 
 class SvANetROIAdapter(nn.Module):
-    """Crop original images, run unchanged SvANet, and paste ROI logits back."""
+    """Crop original images, run unchanged SvANet, and safely fuse ROI logits.
+
+    The legacy destructive behavior remains available through
+    ``paste_mode="replace_roi", outside_roi="zero"``.  New callers default to
+    convex logit blending and preserve the SAM3 prediction outside every ROI.
+    """
+
+    _FALLBACK_CHAINS = {
+        "locator_then_box_then_skip": ("locator", "box", "skip"),
+        "locator_then_box_then_full_image": (
+            "locator", "box", "full_image",
+        ),
+        "locator_then_skip": ("locator", "skip"),
+        "locator_then_full_image": ("locator", "full_image"),
+        "box_then_skip": ("box", "skip"),
+        # Kept for checkpoints/configs produced by the original implementation.
+        "box_then_full_image": ("box", "full_image"),
+        "skip": ("skip",),
+        "full_image": ("full_image",),
+    }
 
     def __init__(
         self,
@@ -217,18 +306,49 @@ class SvANetROIAdapter(nn.Module):
         roi_expand_ratio: float = 0.25,
         min_roi_size: int = 32,
         mask_threshold: float = 0.5,
-        empty_mask_fallback: str = "box_then_full_image",
-        paste_mode: str = "replace_roi",
-        outside_roi: str = "zero",
+        empty_mask_fallback: str = "locator_then_box_then_skip",
+        paste_mode: str = "blend_with_sam3",
+        outside_roi: str = "sam3",
         train_trigger: str = "teacher_forcing",
+        fusion_weight: float = 0.5,
+        residual_scale: float = 0.25,
+        sam3_min_confidence: float = 0.0,
+        locator_threshold: float = 0.5,
+        locator_min_confidence: float = 0.0,
+        min_component_pixels: int = 1,
+        max_component_fraction: float = 1.0,
+        min_area_confidence: float = 0.0,
+        confidence_gate_during_training: bool = False,
     ) -> None:
         super().__init__()
-        if empty_mask_fallback != "box_then_full_image":
-            raise ValueError("Only empty_mask_fallback=box_then_full_image is supported")
-        if paste_mode not in {"replace_roi", "blend_with_sam3"}:
-            raise ValueError("paste_mode must be replace_roi or blend_with_sam3")
+        if empty_mask_fallback not in self._FALLBACK_CHAINS:
+            choices = ", ".join(sorted(self._FALLBACK_CHAINS))
+            raise ValueError(
+                f"Unknown empty_mask_fallback={empty_mask_fallback!r}; "
+                f"choose one of: {choices}"
+            )
+        if paste_mode not in {"replace_roi", "blend_with_sam3", "residual"}:
+            raise ValueError(
+                "paste_mode must be replace_roi, blend_with_sam3, or residual"
+            )
         if outside_roi not in {"zero", "sam3"}:
             raise ValueError("outside_roi must be zero or sam3")
+        if not 0.0 <= float(fusion_weight) <= 1.0:
+            raise ValueError("fusion_weight must be in [0, 1]")
+        if float(residual_scale) < 0.0:
+            raise ValueError("residual_scale must be non-negative")
+        for name, value in {
+            "mask_threshold": mask_threshold,
+            "sam3_min_confidence": sam3_min_confidence,
+            "locator_threshold": locator_threshold,
+            "locator_min_confidence": locator_min_confidence,
+            "max_component_fraction": max_component_fraction,
+            "min_area_confidence": min_area_confidence,
+        }.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if int(min_component_pixels) < 1:
+            raise ValueError("min_component_pixels must be positive")
         self.svanet = svanet
         self.input_size = tuple(int(value) for value in input_size)
         self.roi_expand_ratio = float(roi_expand_ratio)
@@ -238,6 +358,17 @@ class SvANetROIAdapter(nn.Module):
         self.paste_mode = paste_mode
         self.outside_roi = outside_roi
         self.train_trigger = train_trigger
+        self.fusion_weight = float(fusion_weight)
+        self.residual_scale = float(residual_scale)
+        self.sam3_min_confidence = float(sam3_min_confidence)
+        self.locator_threshold = float(locator_threshold)
+        self.locator_min_confidence = float(locator_min_confidence)
+        self.min_component_pixels = int(min_component_pixels)
+        self.max_component_fraction = float(max_component_fraction)
+        self.min_area_confidence = float(min_area_confidence)
+        self.confidence_gate_during_training = bool(
+            confidence_gate_during_training
+        )
         self.reset_runtime_stats()
 
     def reset_runtime_stats(self) -> None:
@@ -245,7 +376,11 @@ class SvANetROIAdapter(nn.Module):
             "trigger_count": 0,
             "empty_mask_count": 0,
             "box_fallback_count": 0,
+            "locator_fallback_count": 0,
             "full_image_fallback_count": 0,
+            "unreliable_mask_count": 0,
+            "low_area_confidence_skip_count": 0,
+            "no_reliable_roi_skip_count": 0,
         }
 
     def _zero_refine_loss(self, images: torch.Tensor) -> torch.Tensor:
@@ -322,6 +457,7 @@ class SvANetROIAdapter(nn.Module):
         gt_masks: Optional[torch.Tensor] = None,
         teacher_area_mask: Optional[torch.Tensor] = None,
         use_gt_roi: bool = False,
+        locator_logits: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if images.ndim != 4 or sam3_logits.ndim not in {3, 4}:
             raise ValueError("Expected images[B,C,H,W] and sam3_logits[B,H,W]")
@@ -330,15 +466,65 @@ class SvANetROIAdapter(nn.Module):
                 raise ValueError("4D sam3_logits must have one channel")
             sam3_logits = sam3_logits[:, 0]
         batch, _, height, width = images.shape
+        if area_logits.ndim != 2 or area_logits.shape[1] != 3:
+            raise ValueError(
+                "area_logits must have shape [B,3], got "
+                f"{tuple(area_logits.shape)}"
+            )
         if sam3_logits.shape[0] != batch or area_logits.shape[0] != batch:
             raise ValueError("Image, SAM3 logits and area logits batch sizes must match")
+        for name, values in (
+            ("area_labels", area_labels),
+            ("teacher_area_mask", teacher_area_mask),
+        ):
+            if values is not None and (values.ndim != 1 or values.shape[0] != batch):
+                raise ValueError(
+                    f"{name} must have shape [B], got {tuple(values.shape)}"
+                )
         if sam3_logits.shape[-2:] != (height, width):
             sam3_logits = F.interpolate(
                 sam3_logits[:, None].float(), (height, width), mode="bilinear", align_corners=False
             )[:, 0].to(images.dtype)
-        trigger = select_small_triggers(
+        if gt_masks is not None:
+            if gt_masks.ndim == 4:
+                if gt_masks.shape[1] != 1:
+                    raise ValueError("4D gt_masks must have one channel")
+                gt_masks = gt_masks[:, 0]
+            if gt_masks.ndim != 3 or gt_masks.shape[0] != batch:
+                raise ValueError("gt_masks must be [B,H,W] or [B,1,H,W]")
+        if locator_logits is not None:
+            if locator_logits.ndim == 4:
+                if locator_logits.shape[1] != 1:
+                    raise ValueError("4D locator_logits must have one channel")
+                locator_logits = locator_logits[:, 0]
+            if locator_logits.ndim != 3 or locator_logits.shape[0] != batch:
+                raise ValueError(
+                    "locator_logits must be [B,H,W] or [B,1,H,W]"
+                )
+            if locator_logits.shape[-2:] != (height, width):
+                locator_logits = F.interpolate(
+                    locator_logits[:, None].float(),
+                    (height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )[:, 0].to(images.dtype)
+
+        requested_trigger = select_small_triggers(
             area_logits, self.training, self.train_trigger,
             area_labels=area_labels, teacher_area_mask=teacher_area_mask,
+        )
+        area_small_probability = area_logits.float().softmax(dim=-1)[:, 0]
+        confidence_gate = (
+            not self.training or self.confidence_gate_during_training
+        )
+        low_area_confidence = (
+            requested_trigger
+            & confidence_gate
+            & (area_small_probability < self.min_area_confidence)
+        )
+        trigger = requested_trigger & ~low_area_confidence
+        self.runtime_stats["low_area_confidence_skip_count"] += int(
+            low_area_confidence.sum().item()
         )
         trigger_indices = trigger.nonzero(as_tuple=False).flatten().tolist()
         prompts = box_prompts or [None] * batch
@@ -356,25 +542,93 @@ class SvANetROIAdapter(nn.Module):
         roi_images: List[torch.Tensor] = []
         roi_targets: List[torch.Tensor] = []
         sources: List[str] = []
+        source_confidences: List[float] = []
+        refine_indices: List[int] = []
+        skipped_indices: List[int] = low_area_confidence.nonzero(
+            as_tuple=False
+        ).flatten().tolist()
+        proposal_diagnostics: List[Dict[str, Any]] = []
+        batch_empty_mask_count = 0
+        batch_unreliable_mask_count = 0
         for index in trigger_indices:
-            source_mask = (
-                gt_masks[index].bool()
-                if use_gt_roi and gt_masks is not None
-                else sam3_logits[index].sigmoid() > self.mask_threshold
-            )
-            box = largest_component_bbox(source_mask)
-            source = "gt_mask" if use_gt_roi and gt_masks is not None else "sam3_mask"
-            if box is None:
-                self.runtime_stats["empty_mask_count"] += 1
-                prompt = self._prompt_box(
-                    prompts[index], height, width, prompt_sizes[index]
+            diagnostics: Dict[str, Any] = {"image_index": index}
+            confidence = 1.0
+            if use_gt_roi and gt_masks is not None:
+                box = largest_component_bbox(gt_masks[index].bool())
+                source = "gt_mask"
+                diagnostics["gt_mask"] = {
+                    "reason": "accepted" if box is not None else "empty"
+                }
+            else:
+                box, sam3_stats = _largest_component_candidate(
+                    sam3_logits[index].float().sigmoid(),
+                    threshold=self.mask_threshold,
+                    min_confidence=self.sam3_min_confidence,
+                    min_component_pixels=self.min_component_pixels,
+                    max_component_fraction=self.max_component_fraction,
                 )
-                if prompt is not None:
-                    box, source = tuple(prompt), "box_fallback"
-                    self.runtime_stats["box_fallback_count"] += 1
+                diagnostics["sam3_mask"] = sam3_stats
+                source = "sam3_mask"
+                confidence = float(sam3_stats["confidence"])
+
+            if box is None:
+                # Keep the historical empty counter while separately exposing
+                # rejected non-empty masks for reliability analysis.
+                reason = diagnostics.get(source, {}).get("reason", "empty")
+                if reason == "empty":
+                    self.runtime_stats["empty_mask_count"] += 1
+                    batch_empty_mask_count += 1
                 else:
-                    box, source = (0, 0, width, height), "full_image_fallback"
-                    self.runtime_stats["full_image_fallback_count"] += 1
+                    self.runtime_stats["unreliable_mask_count"] += 1
+                    batch_unreliable_mask_count += 1
+
+                for fallback in self._FALLBACK_CHAINS[
+                    self.empty_mask_fallback
+                ]:
+                    if fallback == "locator":
+                        if locator_logits is None:
+                            diagnostics["locator_mask"] = {
+                                "reason": "unavailable"
+                            }
+                            continue
+                        candidate, locator_stats = _largest_component_candidate(
+                            locator_logits[index].float().sigmoid(),
+                            threshold=self.locator_threshold,
+                            min_confidence=self.locator_min_confidence,
+                            min_component_pixels=self.min_component_pixels,
+                            max_component_fraction=self.max_component_fraction,
+                        )
+                        diagnostics["locator_mask"] = locator_stats
+                        if candidate is not None:
+                            box, source = candidate, "locator_fallback"
+                            confidence = float(locator_stats["confidence"])
+                            self.runtime_stats["locator_fallback_count"] += 1
+                            break
+                    elif fallback == "box":
+                        prompt = self._prompt_box(
+                            prompts[index], height, width, prompt_sizes[index]
+                        )
+                        if prompt is not None:
+                            box, source = tuple(prompt), "box_fallback"
+                            confidence = 1.0
+                            self.runtime_stats["box_fallback_count"] += 1
+                            break
+                    elif fallback == "full_image":
+                        box, source = (0, 0, width, height), "full_image_fallback"
+                        confidence = 0.0
+                        self.runtime_stats["full_image_fallback_count"] += 1
+                        break
+                    elif fallback == "skip":
+                        source = "no_reliable_roi_skip"
+                        break
+
+            if box is None:
+                skipped_indices.append(index)
+                diagnostics["decision"] = "skip"
+                proposal_diagnostics.append(diagnostics)
+                self.runtime_stats["no_reliable_roi_skip_count"] += 1
+                continue
+
             roi = expand_and_clip_roi(
                 box, height, width, self.roi_expand_ratio, self.min_roi_size
             )
@@ -390,6 +644,10 @@ class SvANetROIAdapter(nn.Module):
             rois.append(roi)
             roi_images.append(crop)
             sources.append(source)
+            source_confidences.append(confidence)
+            refine_indices.append(index)
+            diagnostics["decision"] = source
+            proposal_diagnostics.append(diagnostics)
             if gt_masks is not None:
                 target = gt_masks[index : index + 1, None, y1:y2, x1:x2].float()
                 roi_targets.append(F.interpolate(target, self.input_size, mode="nearest")[0, 0])
@@ -455,7 +713,7 @@ class SvANetROIAdapter(nn.Module):
                     roi_logits[:, None].float(), self.input_size,
                     mode="bilinear", align_corners=False,
                 )[:, 0].to(images.dtype)
-            for local_index, image_index in enumerate(trigger_indices):
+            for local_index, image_index in enumerate(refine_indices):
                 x1, y1, x2, y2 = rois[local_index]
                 resized = F.interpolate(
                     roi_logits[local_index : local_index + 1, None].float(),
@@ -465,9 +723,17 @@ class SvANetROIAdapter(nn.Module):
                     if self.outside_roi == "zero":
                         final_logits[image_index] = torch.full_like(final_logits[image_index], -20.0)
                     final_logits[image_index, y1:y2, x1:x2] = resized
+                elif self.paste_mode == "blend_with_sam3":
+                    base = final_logits[image_index, y1:y2, x1:x2]
+                    final_logits[image_index, y1:y2, x1:x2] = (
+                        (1.0 - self.fusion_weight) * base
+                        + self.fusion_weight * resized
+                    )
                 else:
                     base = final_logits[image_index, y1:y2, x1:x2]
-                    final_logits[image_index, y1:y2, x1:x2] = 0.5 * (base + resized)
+                    final_logits[image_index, y1:y2, x1:x2] = (
+                        base + self.residual_scale * resized
+                    )
                 roi_logits_list.append(roi_logits[local_index])
             refine_loss = (
                 dice_bce_with_logits(
@@ -491,24 +757,46 @@ class SvANetROIAdapter(nn.Module):
                     "the SvANet parameters are already contaminated"
                 )
 
-        self.runtime_stats["trigger_count"] += len(trigger_indices)
+        self.runtime_stats["trigger_count"] += len(refine_indices)
+        refined_mask = torch.zeros_like(requested_trigger, dtype=torch.bool)
+        if refine_indices:
+            refined_mask[refine_indices] = True
         widths = [roi[2] - roi[0] for roi in rois]
         heights = [roi[3] - roi[1] for roi in rois]
         return {
             "final_logits": final_logits,
             "refine_loss": refine_loss,
-            "trigger_mask": trigger,
+            # ``trigger_mask`` historically drives ROI-list indexing in
+            # inference utilities, so it must denote crops that actually ran.
+            "trigger_mask": refined_mask,
+            "requested_trigger_mask": requested_trigger,
+            "confidence_qualified_trigger_mask": trigger,
+            "low_area_confidence_mask": low_area_confidence,
+            "area_small_probability": area_small_probability,
             "roi_boxes": rois,
             "roi_sources": sources,
+            "roi_source_confidences": source_confidences,
+            "proposal_diagnostics": proposal_diagnostics,
+            "refined_indices": refine_indices,
+            "skipped_indices": skipped_indices,
             "roi_images": roi_images,
             "roi_gt": roi_targets,
             "svanet_roi_logits": roi_logits_list,
             "batch_stats": {
-                "small_count": int(trigger.sum().item()),
-                "trigger_count": len(trigger_indices),
-                "empty_mask_count": sum(source.endswith("fallback") for source in sources),
+                "small_count": int(requested_trigger.sum().item()),
+                "trigger_count": len(refine_indices),
+                "empty_mask_count": batch_empty_mask_count,
+                "unreliable_mask_count": batch_unreliable_mask_count,
                 "box_fallback_count": sources.count("box_fallback"),
+                "locator_fallback_count": sources.count("locator_fallback"),
                 "full_image_fallback_count": sources.count("full_image_fallback"),
+                "low_area_confidence_skip_count": int(
+                    low_area_confidence.sum().item()
+                ),
+                "no_reliable_roi_skip_count": sum(
+                    diagnostic.get("decision") == "skip"
+                    for diagnostic in proposal_diagnostics
+                ),
                 "mean_roi_width": float(np.mean(widths)) if widths else 0.0,
                 "mean_roi_height": float(np.mean(heights)) if heights else 0.0,
             },

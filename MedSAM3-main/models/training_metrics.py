@@ -12,7 +12,7 @@ from .moe_lora import AREA_CLASSES, BOUNDARY_CLASSES, MODALITIES
 
 
 LOSS_NAMES = (
-    "total_loss", "sam3_loss", "aux_loss", "modality_loss", "area_loss",
+    "total_loss", "sam3_loss", "aux_loss", "locator_loss", "modality_loss", "area_loss",
     "area_reg_loss", "boundary_router_loss", "boundary_seg_loss",
     "load_balance_loss", "refine_loss",
 )
@@ -40,6 +40,9 @@ class EpochStatistics:
         self.router_correct = defaultdict(int)
         self.router_total = defaultdict(int)
         self.entropy_sum = defaultdict(float)
+        self.routing_confidence_sum = defaultdict(float)
+        self.routing_confidence_count = defaultdict(int)
+        self.routing_policy_counts = defaultdict(int)
         self.expert_counts = {
             f"{modality}_area_{label}": 0
             for modality in MODALITIES for label in AREA_CLASSES
@@ -52,6 +55,7 @@ class EpochStatistics:
         self.teacher_total = 0
         self.svanet = defaultdict(float)
         self.svanet_batches = 0
+        self.prompt_counts = defaultdict(int)
         self.slice_records = []
 
     def state_dict(self) -> Dict[str, Any]:
@@ -63,11 +67,15 @@ class EpochStatistics:
             "router_correct": dict(self.router_correct),
             "router_total": dict(self.router_total),
             "entropy_sum": dict(self.entropy_sum),
+            "routing_confidence_sum": dict(self.routing_confidence_sum),
+            "routing_confidence_count": dict(self.routing_confidence_count),
+            "routing_policy_counts": dict(self.routing_policy_counts),
             "expert_counts": dict(self.expert_counts),
             "teacher_used": int(self.teacher_used),
             "teacher_total": int(self.teacher_total),
             "svanet": dict(self.svanet),
             "svanet_batches": int(self.svanet_batches),
+            "prompt_counts": dict(self.prompt_counts),
             "slice_records": list(self.slice_records),
         }
 
@@ -79,6 +87,15 @@ class EpochStatistics:
         self.router_correct = defaultdict(int, state.get("router_correct", {}))
         self.router_total = defaultdict(int, state.get("router_total", {}))
         self.entropy_sum = defaultdict(float, state.get("entropy_sum", {}))
+        self.routing_confidence_sum = defaultdict(
+            float, state.get("routing_confidence_sum", {})
+        )
+        self.routing_confidence_count = defaultdict(
+            int, state.get("routing_confidence_count", {})
+        )
+        self.routing_policy_counts = defaultdict(
+            int, state.get("routing_policy_counts", {})
+        )
         restored_experts = dict(state.get("expert_counts", {}))
         for name in self.expert_counts:
             self.expert_counts[name] = int(restored_experts.get(name, 0))
@@ -86,6 +103,7 @@ class EpochStatistics:
         self.teacher_total = int(state.get("teacher_total", 0))
         self.svanet = defaultdict(float, state.get("svanet", {}))
         self.svanet_batches = int(state.get("svanet_batches", 0))
+        self.prompt_counts = defaultdict(int, state.get("prompt_counts", {}))
         self.slice_records = list(state.get("slice_records", []))
 
     def update_losses(self, components: Mapping[str, Any], weight: int = 1) -> None:
@@ -106,7 +124,9 @@ class EpochStatistics:
         self, routes: Mapping[str, torch.Tensor], targets: Mapping[str, torch.Tensor]
     ) -> None:
         for family in ("modality", "area", "boundary"):
-            logits = routes[f"{family}_logits"].detach()
+            logits = routes.get(
+                f"{family}_selected_logits", routes[f"{family}_logits"]
+            ).detach()
             target = targets[family].to(logits.device).long()
             prediction = logits.argmax(dim=-1)
             self.router_correct[family] += int((prediction == target).sum().item())
@@ -115,17 +135,47 @@ class EpochStatistics:
             entropy = -(probabilities * probabilities.log()).sum(dim=-1)
             self.entropy_sum[family] += float(entropy.sum().item())
 
-        modality = routes["modality"].detach().argmax(dim=-1)
-        area = routes["area"].detach().argmax(dim=-1)
-        boundary = routes["boundary"].detach().argmax(dim=-1)
-        for modality_index, area_index, boundary_index in zip(
-            modality.tolist(), area.tolist(), boundary.tolist()
-        ):
-            prefix = MODALITIES[modality_index]
-            self.expert_counts[f"{prefix}_area_{AREA_CLASSES[area_index]}"] += 1
-            self.expert_counts[
-                f"{prefix}_boundary_{BOUNDARY_CLASSES[boundary_index]}"
-            ] += 1
+        policy_names = {0: "shared", 1: "topk", 2: "top1"}
+        for family in ("area", "boundary"):
+            confidence = routes.get(f"{family}_routing_confidence")
+            if confidence is not None:
+                confidence = confidence.detach()
+                self.routing_confidence_sum[family] += float(confidence.sum().item())
+                self.routing_confidence_count[family] += int(confidence.numel())
+            policy = routes.get(f"{family}_routing_policy")
+            if policy is not None:
+                policy = policy.detach()
+                for code, name in policy_names.items():
+                    self.routing_policy_counts[f"{family}_{name}"] += int(
+                        (policy == code).sum().item()
+                    )
+
+        # V2 joint routes expose the experts actually executed. In particular,
+        # shared-path fallback is all-zero and must not be misreported as the
+        # first (MR/small or MR/smooth) expert; medium-confidence top-k records
+        # every activated expert.
+        if "area_joint" in routes and "boundary_joint" in routes:
+            for family, labels in (
+                ("area", AREA_CLASSES), ("boundary", BOUNDARY_CLASSES)
+            ):
+                active = routes[f"{family}_joint"].detach().abs() > 1e-8
+                for modality_index, modality_name in enumerate(MODALITIES):
+                    for class_index, class_name in enumerate(labels):
+                        self.expert_counts[
+                            f"{modality_name}_{family}_{class_name}"
+                        ] += int(active[:, modality_index, class_index].sum().item())
+        else:
+            modality = routes["modality"].detach().argmax(dim=-1)
+            area = routes["area"].detach().argmax(dim=-1)
+            boundary = routes["boundary"].detach().argmax(dim=-1)
+            for modality_index, area_index, boundary_index in zip(
+                modality.tolist(), area.tolist(), boundary.tolist()
+            ):
+                prefix = MODALITIES[modality_index]
+                self.expert_counts[f"{prefix}_area_{AREA_CLASSES[area_index]}"] += 1
+                self.expert_counts[
+                    f"{prefix}_boundary_{BOUNDARY_CLASSES[boundary_index]}"
+                ] += 1
         for family in ("modality", "area", "boundary"):
             mask = routes.get(f"teacher_{family}_mask")
             if mask is not None:
@@ -138,7 +188,9 @@ class EpochStatistics:
         stats = output.get("batch_stats", {})
         for name in (
             "small_count", "trigger_count", "empty_mask_count",
-            "box_fallback_count", "full_image_fallback_count",
+            "box_fallback_count", "locator_fallback_count",
+            "full_image_fallback_count", "unreliable_mask_count",
+            "low_area_confidence_skip_count", "no_reliable_roi_skip_count",
         ):
             self.svanet[name] += float(stats.get(name, 0))
         trigger_count = float(stats.get("trigger_count", 0))
@@ -169,6 +221,7 @@ class EpochStatistics:
                 align_corners=False,
             )[:, 0]
         for index, item in enumerate(metadata):
+            self.prompt_counts[str(item.get("prompt_mode", "unknown"))] += 1
             base_dice, base_iou = _binary_scores(base_logits[index], gt_masks[index])
             final_dice, final_iou = _binary_scores(final_logits[index], gt_masks[index])
             self.slice_records.append({
@@ -189,11 +242,18 @@ class EpochStatistics:
         for name, value in other.router_correct.items(): self.router_correct[name] += value
         for name, value in other.router_total.items(): self.router_total[name] += value
         for name, value in other.entropy_sum.items(): self.entropy_sum[name] += value
+        for name, value in other.routing_confidence_sum.items():
+            self.routing_confidence_sum[name] += value
+        for name, value in other.routing_confidence_count.items():
+            self.routing_confidence_count[name] += value
+        for name, value in other.routing_policy_counts.items():
+            self.routing_policy_counts[name] += value
         for name, value in other.expert_counts.items(): self.expert_counts[name] += value
         self.teacher_used += other.teacher_used
         self.teacher_total += other.teacher_total
         for name, value in other.svanet.items(): self.svanet[name] += value
         self.svanet_batches += other.svanet_batches
+        for name, value in other.prompt_counts.items(): self.prompt_counts[name] += value
         self.slice_records.extend(other.slice_records)
 
     @staticmethod
@@ -241,13 +301,37 @@ class EpochStatistics:
         router["actual_teacher_forcing_ratio"] = (
             self.teacher_used / self.teacher_total if self.teacher_total else 0.0
         )
+        for family in ("area", "boundary"):
+            confidence_count = self.routing_confidence_count[family]
+            router[f"{family}_routing_confidence"] = (
+                self.routing_confidence_sum[family] / confidence_count
+                if confidence_count else 0.0
+            )
+            policy_total = sum(
+                self.routing_policy_counts[f"{family}_{name}"]
+                for name in ("shared", "topk", "top1")
+            )
+            for name in ("shared", "topk", "top1"):
+                count = self.routing_policy_counts[f"{family}_{name}"]
+                router[f"{family}_{name}_count"] = int(count)
+                router[f"{family}_{name}_ratio"] = (
+                    count / policy_total if policy_total else 0.0
+                )
         triggers = self.svanet["trigger_count"]
         svanet = {
             "small_count": int(self.svanet["small_count"]),
             "trigger_count": int(triggers),
             "empty_mask_count": int(self.svanet["empty_mask_count"]),
             "box_fallback_count": int(self.svanet["box_fallback_count"]),
+            "locator_fallback_count": int(self.svanet["locator_fallback_count"]),
             "full_image_fallback_count": int(self.svanet["full_image_fallback_count"]),
+            "unreliable_mask_count": int(self.svanet["unreliable_mask_count"]),
+            "low_area_confidence_skip_count": int(
+                self.svanet["low_area_confidence_skip_count"]
+            ),
+            "no_reliable_roi_skip_count": int(
+                self.svanet["no_reliable_roi_skip_count"]
+            ),
             "mean_roi_width": self.svanet["roi_width_weighted"] / triggers if triggers else 0.0,
             "mean_roi_height": self.svanet["roi_height_weighted"] / triggers if triggers else 0.0,
             "refine_loss": self.svanet["refine_loss"] / self.svanet_batches if self.svanet_batches else 0.0,
@@ -260,5 +344,6 @@ class EpochStatistics:
             "router": router,
             "experts": dict(self.expert_counts),
             "svanet": svanet,
+            "prompts": dict(self.prompt_counts),
             "segmentation": self.segmentation_report(),
         }

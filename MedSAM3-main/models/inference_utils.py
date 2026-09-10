@@ -82,16 +82,67 @@ def normalized_xyxy_prompts(find_input: Any) -> Sequence[Optional[torch.Tensor]]
 
 def route_predictions(routes: Dict[str, torch.Tensor], index: int) -> Dict[str, Any]:
     modality = int(routes["modality_logits"][index].argmax().item())
-    area = int(routes["area_logits"][index].argmax().item())
-    boundary = int(routes["boundary_logits"][index].argmax().item())
     prefix = MODALITIES[modality]
-    return {
+    modality_probabilities = routes["modality_soft"][index]
+    result: Dict[str, Any] = {
         "modality": prefix,
-        "modality_probs": routes["modality_soft"][index].detach().cpu().tolist(),
-        "area": AREA_CLASSES[area],
-        "area_probs": routes["area_soft"][index].detach().cpu().tolist(),
-        "boundary": BOUNDARY_CLASSES[boundary],
-        "boundary_probs": routes["boundary_soft"][index].detach().cpu().tolist(),
-        "area_expert": f"{prefix}_area_{AREA_CLASSES[area]}",
-        "boundary_expert": f"{prefix}_boundary_{BOUNDARY_CLASSES[boundary]}",
+        "modality_probs": modality_probabilities.detach().cpu().tolist(),
+        "modality_confidence": float(modality_probabilities.max().item()),
     }
+    policy_names = {0: "shared", 1: "topk", 2: "top1"}
+    for family, labels in (
+        ("area", AREA_CLASSES), ("boundary", BOUNDARY_CLASSES)
+    ):
+        all_probabilities = routes.get(f"{family}_soft_all")
+        probabilities = (
+            all_probabilities[index, modality]
+            if all_probabilities is not None
+            else routes[f"{family}_soft"][index]
+        )
+        class_index = int(probabilities.argmax().item())
+        confidence_tensor = routes.get(f"{family}_routing_confidence")
+        confidence = (
+            float(confidence_tensor[index].item())
+            if confidence_tensor is not None
+            else min(
+                float(modality_probabilities.max().item()),
+                float(probabilities.max().item()),
+            )
+        )
+        policy_tensor = routes.get(f"{family}_routing_policy")
+        policy_code = (
+            int(policy_tensor[index].item()) if policy_tensor is not None else 2
+        )
+        joint = routes.get(f"{family}_joint")
+        active_experts = []
+        primary_expert = None
+        if joint is not None:
+            sample_joint = joint[index].detach()
+            active = (sample_joint.abs() > 1e-8).nonzero(as_tuple=False)
+            for modality_index, child_index in active.tolist():
+                active_experts.append(
+                    f"{MODALITIES[modality_index]}_{family}_{labels[child_index]}"
+                )
+            if active.numel():
+                flat_index = int(sample_joint.argmax().item())
+                primary_modality = flat_index // len(labels)
+                primary_child = flat_index % len(labels)
+                primary_expert = (
+                    f"{MODALITIES[primary_modality]}_{family}_{labels[primary_child]}"
+                )
+        else:
+            primary_expert = f"{prefix}_{family}_{labels[class_index]}"
+            active_experts = [primary_expert]
+        result.update(
+            {
+                family: labels[class_index],
+                f"{family}_probs": probabilities.detach().cpu().tolist(),
+                f"{family}_confidence": confidence,
+                f"{family}_policy": policy_names.get(
+                    policy_code, f"unknown_{policy_code}"
+                ),
+                f"{family}_expert": primary_expert,
+                f"{family}_active_experts": active_experts,
+            }
+        )
+    return result

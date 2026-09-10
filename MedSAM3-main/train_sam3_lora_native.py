@@ -113,6 +113,41 @@ def print_rank0(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def set_global_seed(
+    seed: int,
+    *,
+    rank: int = 0,
+    deterministic: bool = False,
+    deterministic_warn_only: bool = True,
+    cudnn_benchmark: bool = False,
+) -> int:
+    """Seed every RNG used by training and configure deterministic kernels.
+
+    Each DDP rank receives a distinct, reproducible RNG stream. DDP still
+    broadcasts rank-0 parameters, while stochastic routing/augmentation is not
+    accidentally identical on every worker.
+    """
+    effective_seed = int(seed) + int(rank)
+    random.seed(effective_seed)
+    np.random.seed(effective_seed % (2**32))
+    torch.manual_seed(effective_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(effective_seed)
+
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark and not deterministic)
+    if deterministic:
+        # Required by deterministic CUDA matrix multiplications on recent
+        # PyTorch/CUDA versions. ``setdefault`` preserves a server-level choice.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(
+            True, warn_only=bool(deterministic_warn_only)
+        )
+    else:
+        torch.use_deterministic_algorithms(False)
+    return effective_seed
+
+
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
     def __init__(self, data_dir, split="train", annotation_file=None):
@@ -790,6 +825,7 @@ class SAM3TrainerNative:
         svanet_config=None,
         resume_path=None,
         load_stage_dependencies=True,
+        load_training_resume=True,
         wandb_settings=None,
     ):
         with open(config_path, "r") as f:
@@ -830,6 +866,28 @@ class SAM3TrainerNative:
             print_rank0(f"Multi-GPU training enabled with {self.world_size} GPUs")
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        training_config = self.config.get("training", {}) or {}
+        self.seed = int(
+            training_config.get(
+                "seed", training_config.get("data_order_seed", 42)
+            )
+        )
+        self.effective_seed = set_global_seed(
+            self.seed,
+            rank=get_rank(),
+            deterministic=bool(training_config.get("deterministic", False)),
+            deterministic_warn_only=bool(
+                training_config.get("deterministic_warn_only", True)
+            ),
+            cudnn_benchmark=bool(training_config.get("cudnn_benchmark", False)),
+        )
+        print_rank0(
+            "Reproducibility: "
+            f"seed={self.seed}, "
+            f"deterministic={bool(training_config.get('deterministic', False))}, "
+            f"cudnn_benchmark={torch.backends.cudnn.benchmark}"
+        )
 
         # Build Model
         print_rank0("Building SAM3 model...")
@@ -894,6 +952,7 @@ class SAM3TrainerNative:
             component_weights = {
                 "sam3_loss": float(loss_config.get("lambda_sam3", 1.0)),
                 "aux_loss": float(loss_config.get("lambda_aux", 1.0)),
+                "locator_loss": float(loss_config.get("lambda_locator", 1.0)),
                 "modality_loss": float(loss_config.get("lambda_modality", 1.0)),
                 "area_loss": float(loss_config.get("lambda_area", 1.0)),
                 "area_reg_loss": float(loss_config.get("lambda_area_reg", 0.2)),
@@ -923,9 +982,10 @@ class SAM3TrainerNative:
         if self.training_stage is not None:
             if self.moe_controller is None:
                 raise ValueError("Staged training requires Hierarchical MoE")
-            if self.training_stage in {4, 5}:
-                if not self.svanet_config.get("enable", True):
-                    raise ValueError("Stage 4/5 requires svanet.enable=true")
+            svanet_enabled = bool(self.svanet_config.get("enable", True))
+            if self.training_stage == 4 and not svanet_enabled:
+                raise ValueError("Stage 4 requires svanet.enable=true")
+            if self.training_stage in {4, 5} and svanet_enabled:
                 from models.svanet_roi_adapter import (
                     SvANetROIAdapter, build_original_svanet,
                 )
@@ -952,10 +1012,39 @@ class SAM3TrainerNative:
                     roi_expand_ratio=float(self.svanet_config.get("roi_expand_ratio", 0.25)),
                     min_roi_size=int(self.svanet_config.get("min_roi_size", 32)),
                     mask_threshold=float(self.svanet_config.get("mask_threshold", 0.5)),
-                    empty_mask_fallback=self.svanet_config.get("empty_mask_fallback", "box_then_full_image"),
-                    paste_mode=self.svanet_config.get("paste_mode", "replace_roi"),
-                    outside_roi=self.svanet_config.get("outside_roi", "zero"),
+                    empty_mask_fallback=self.svanet_config.get(
+                        "empty_mask_fallback", "locator_then_box_then_skip"
+                    ),
+                    paste_mode=self.svanet_config.get(
+                        "paste_mode", "blend_with_sam3"
+                    ),
+                    outside_roi=self.svanet_config.get("outside_roi", "sam3"),
                     train_trigger=self.svanet_config.get("train_trigger", "teacher_forcing"),
+                    fusion_weight=float(self.svanet_config.get("fusion_weight", 0.5)),
+                    residual_scale=float(self.svanet_config.get("residual_scale", 0.25)),
+                    sam3_min_confidence=float(
+                        self.svanet_config.get("sam3_min_confidence", 0.55)
+                    ),
+                    locator_threshold=float(
+                        self.svanet_config.get("locator_threshold", 0.5)
+                    ),
+                    locator_min_confidence=float(
+                        self.svanet_config.get("locator_min_confidence", 0.55)
+                    ),
+                    min_component_pixels=int(
+                        self.svanet_config.get("min_component_pixels", 16)
+                    ),
+                    max_component_fraction=float(
+                        self.svanet_config.get("max_component_fraction", 0.8)
+                    ),
+                    min_area_confidence=float(
+                        self.svanet_config.get("min_area_confidence", 0.45)
+                    ),
+                    confidence_gate_during_training=bool(
+                        self.svanet_config.get(
+                            "confidence_gate_during_training", False
+                        )
+                    ),
                 ).to(self.device)
 
         stats = count_parameters(self.model)
@@ -1063,7 +1152,9 @@ class SAM3TrainerNative:
             else:
                 raise ValueError(f"Unsupported scheduler.type: {scheduler_type}")
 
-        configured_resume = self.resume_path or self.config.get("training", {}).get("resume")
+        configured_resume = (
+            self.resume_path or self.config.get("training", {}).get("resume")
+        ) if load_training_resume else None
         if configured_resume:
             if self.stage_manager is None:
                 raise ValueError("Stage checkpoint resume is only available in MoE staged training")
@@ -1208,7 +1299,10 @@ class SAM3TrainerNative:
             for name, loss in self.last_router_losses.items():
                 total_loss = total_loss + self.router_loss_weights[name] * loss
             return total_loss
-        from models.moe_losses import extract_matched_masks
+        from models.moe_losses import (
+            extract_matched_locator_logits,
+            extract_matched_masks,
+        )
 
         if self.moe_controller.current_routes is None:
             raise RuntimeError("MoE routes are unavailable after SAM3 forward")
@@ -1219,6 +1313,11 @@ class SAM3TrainerNative:
             final_output,
             find_targets[-1],
             self.moe_controller.current_routes.get("coarse_mask_p3"),
+        )
+        locator_logits = extract_matched_locator_logits(
+            final_output,
+            find_targets[-1],
+            self.moe_controller.current_routes.get("image_locator_logits"),
         )
         routing_losses = self.moe_controller.routing_supervision_losses()
         # Preserve SAM3's complete native objective.  HierarchicalMoELoss adds
@@ -1232,6 +1331,7 @@ class SAM3TrainerNative:
             routes=self.moe_controller.current_routes,
             routing_losses=routing_losses,
             area_ratio_gt=self.moe_controller.routing_targets["area_ratio"],
+            locator_logits=locator_logits,
         )
         if final_logits.shape[0] > 0 and input_batch is not None:
             batch_idx, _, target_idx = final_output["indices"]
@@ -1271,15 +1371,18 @@ class SAM3TrainerNative:
                 adapter_output = self.svanet_adapter(
                     images=images,
                     sam3_logits=final_logits,
-                    area_logits=routes["area_logits"][batch_idx],
+                    area_logits=routes.get(
+                        "area_selected_logits", routes["area_logits"]
+                    )[batch_idx],
                     area_labels=self.moe_controller.routing_targets["area"][batch_idx],
                     box_prompts=box_prompts,
                     gt_masks=gt_masks,
                     teacher_area_mask=teacher_area_mask,
-                    use_gt_roi=(
-                        bool(self.svanet_config.get("use_gt_roi_for_warmup", True))
-                        and epoch < int(self.svanet_config.get("gt_roi_warmup_epochs", 2))
-                        and self.svanet_adapter.training
+                    use_gt_roi=self._sample_gt_roi_teacher(epoch),
+                    locator_logits=(
+                        routes["image_locator_logits"][batch_idx]
+                        if "image_locator_logits" in routes
+                        else None
                     ),
                 )
                 refine_loss = adapter_output["refine_loss"]
@@ -1308,6 +1411,37 @@ class SAM3TrainerNative:
         decay_epochs = max(int(teacher.get("decay_epochs", 20)), 1)
         progress = min(max(float(epoch) / decay_epochs, 0.0), 1.0)
         return start + (end - start) * progress
+
+    def _roi_teacher_forcing_ratio(self, epoch):
+        """Scheduled GT-ROI exposure; always reaches zero for deployment."""
+        schedule = self.svanet_config.get("roi_teacher_forcing") or {}
+        if schedule:
+            if not schedule.get("enabled", True):
+                return 0.0
+            start = float(schedule.get("start_ratio", 0.5))
+            end = float(schedule.get("end_ratio", 0.0))
+            if not 0.0 <= start <= 1.0 or not 0.0 <= end <= 1.0:
+                raise ValueError(
+                    "svanet.roi_teacher_forcing ratios must be in [0, 1]"
+                )
+            decay_epochs = max(int(schedule.get("decay_epochs", 10)), 1)
+            progress = min(max(float(epoch) / decay_epochs, 0.0), 1.0)
+            return start + (end - start) * progress
+        # Backward-compatible interpretation for old experiment files.
+        return float(
+            bool(self.svanet_config.get("use_gt_roi_for_warmup", True))
+            and epoch < int(self.svanet_config.get("gt_roi_warmup_epochs", 2))
+        )
+
+    def _sample_gt_roi_teacher(self, epoch):
+        if self.svanet_adapter is None or not self.svanet_adapter.training:
+            return False
+        ratio = self._roi_teacher_forcing_ratio(epoch)
+        if ratio <= 0.0:
+            return False
+        if ratio >= 1.0:
+            return True
+        return bool(torch.rand((), device=self.device).item() < ratio)
 
     def _set_moe_routing_targets(self, metadata, input_batch, epoch, training):
         if self.moe_controller is None:
@@ -1547,6 +1681,13 @@ class SAM3TrainerNative:
             metrics[f"{prefix}/router/{name}"] = float(value)
         for name, value in report.get("svanet", {}).items():
             metrics[f"{prefix}/svanet/{name}"] = float(value)
+        prompt_counts = report.get("prompts", {})
+        prompt_total = sum(float(value) for value in prompt_counts.values())
+        for name, value in prompt_counts.items():
+            metrics[f"{prefix}/prompts/{name}_count"] = float(value)
+            metrics[f"{prefix}/prompts/{name}_ratio"] = (
+                float(value) / prompt_total if prompt_total else 0.0
+            )
         svanet = report.get("svanet", {})
         small_count = float(svanet.get("small_count", 0))
         trigger_count = float(svanet.get("trigger_count", 0))
@@ -1686,6 +1827,17 @@ class SAM3TrainerNative:
                             cfg.get("max_val_slices_per_patient")
                             if is_validation else None
                         )
+                    ),
+                    # Box perturbation is a training augmentation.  Validation
+                    # and test prompts deliberately remain clean.
+                    box_noise_std=(
+                        float(cfg.get("box_noise_std", 0.0)) if training else 0.0
+                    ),
+                    box_noise_max=(cfg.get("box_noise_max") if training else None),
+                    training=training,
+                    prompt_curriculum=cfg.get("prompt_curriculum") or {},
+                    prompt_seed=int(
+                        (cfg.get("prompt_curriculum") or {}).get("seed", seed)
                     ),
                 )
             )
@@ -2018,6 +2170,8 @@ class SAM3TrainerNative:
                     "with training.num_workers=0"
                 )
         for epoch in range(self.start_epoch, epochs):
+            for patient_dataset in self.patient_datasets:
+                patient_dataset.set_epoch(epoch)
             if self.stage_manager is not None:
                 self.stage_manager.set_module_modes(training=True)
 
@@ -2601,6 +2755,13 @@ def launch_distributed_training(args):
         cmd.extend(["--stage", str(args.stage)])
     if getattr(args, "resume", None):
         cmd.extend(["--resume", str(args.resume)])
+    for option, attribute in (
+        ("--box-noise-std", "box_noise_std"),
+        ("--box-noise-max", "box_noise_max"),
+    ):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            cmd.extend([option, str(value)])
 
     # Set environment variable for visible devices
     env = os.environ.copy()

@@ -84,3 +84,34 @@ def test_epoch_statistics_mid_epoch_state_round_trip():
     assert restored.teacher_total == 3
     assert restored.slice_records == original.slice_records
     assert restored.report(0.0) == original.report(0.0)
+
+
+def test_shared_fallback_is_not_counted_as_first_expert():
+    statistics = EpochStatistics()
+    routes = {
+        "modality_logits": torch.tensor([[5.0, 0.0], [0.0, 5.0]]),
+        "area_logits": torch.tensor([[5.0, 0.0, 0.0], [0.0, 5.0, 0.0]]),
+        "boundary_logits": torch.tensor([[5.0, 0.0, 0.0], [0.0, 0.0, 5.0]]),
+        "modality": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "area": torch.zeros(2, 3),
+        "boundary": torch.zeros(2, 3),
+        "area_joint": torch.zeros(2, 2, 3),
+        "boundary_joint": torch.zeros(2, 2, 3),
+        "area_routing_confidence": torch.tensor([0.2, 0.3]),
+        "boundary_routing_confidence": torch.tensor([0.1, 0.4]),
+        "area_routing_policy": torch.zeros(2, dtype=torch.long),
+        "boundary_routing_policy": torch.zeros(2, dtype=torch.long),
+    }
+    targets = {
+        "modality": torch.tensor([0, 1]),
+        "area": torch.tensor([0, 1]),
+        "boundary": torch.tensor([0, 2]),
+    }
+
+    statistics.update_router(routes, targets)
+    report = statistics.report()
+
+    assert sum(report["experts"].values()) == 0
+    assert report["router"]["area_shared_count"] == 2
+    assert report["router"]["area_shared_ratio"] == 1.0
+    assert abs(report["router"]["area_routing_confidence"] - 0.25) < 1e-7

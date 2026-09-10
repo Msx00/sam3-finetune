@@ -1,0 +1,346 @@
+schema_version: 1
+
+# Relative paths are resolved from this file. The generator emits fully resolved
+# training YAML files because train_moe_sam3.py intentionally has no inheritance
+# semantics of its own.
+base_config: ../MedSAM3-main/configs/moe_sam3_stage5_direct.yaml
+train_entry: ../MedSAM3-main/train_moe_sam3.py
+output_name: ablation_hmoe_v2
+
+# Three seeds are suitable for screening. Use at least five seeds for the final
+# table by passing --seeds explicitly.
+seeds: [13, 42, 73]
+
+reference:
+  id: full_v2
+  description: 完整继承当前Stage-5主配置（图像驱动条件HMoE、置信度路由、prompt课程与安全ROI融合）
+  comparison: 所有单因素消融的配对参照
+  # 参照组不重复主配置字段，因此主方法更新后不会出现两份默认值漂移。
+  overrides: {}
+
+experiments:
+  parallel_router:
+    description: 将条件式子路由改为与模态父路由独立的并行子分类器
+    comparison: 验证conditional hierarchy本身的贡献
+    overrides:
+      moe:
+        conditional_hierarchy: false
+
+  prompt_conditioned_no_locator:
+    description: 关闭图像locator，回到prompt/decoder-query驱动路由
+    comparison: 验证无GT提示部署时image locator的贡献
+    overrides:
+      moe:
+        use_image_locator: false
+      loss:
+        lambda_locator: 0.0
+
+  decoder_memory_routing_source:
+    description: 使用prompt融合后的decoder memory作为路由特征源（旧路径/潜在提示泄漏诊断）
+    comparison: 验证prompt融合前backbone FPN严格图像路由相对旧decoder-memory路由的影响
+    overrides:
+      moe:
+        routing_feature_source: decoder_memory
+
+  prompt_rich_training:
+    description: 全程使用固定task token+精确/轻扰动bbox训练，但验证仍固定为image-only
+    comparison: 衡量训练bbox提示依赖与image-only推理域差距
+    overrides:
+      dataset:
+        prompt_curriculum:
+          enabled: true
+          start_probabilities: &accurate_box_prob
+            image_only: 0.0
+            text: 0.0
+            coarse_box: 0.0
+            accurate_box: 1.0
+          end_probabilities: *accurate_box_prob
+
+  image_only_training:
+    description: 全程仅固定内部文本且无bbox
+    comparison: 比较纯image-only训练与混合prompt课程
+    overrides:
+      dataset:
+        prompt_curriculum:
+          start_probabilities: &image_only_prob
+            image_only: 1.0
+            text: 0.0
+            coarse_box: 0.0
+            accurate_box: 0.0
+          end_probabilities: *image_only_prob
+
+  fixed_top1:
+    description: 所有样本固定Top-1，无Top-2和低置信度shared fallback
+    comparison: 验证置信度感知执行策略
+    overrides:
+      moe:
+        confidence_routing: false
+        routing_mode: top1
+
+  no_teacher_routing:
+    description: 从第一个epoch起完全使用预测路由
+    comparison: 验证短期teacher routing warm-up的优化作用
+    overrides:
+      router:
+        use_gt_modality_during_train: false
+        use_gt_area_during_warmup: false
+        use_gt_boundary_during_warmup: false
+        teacher_forcing:
+          enabled: false
+          start_ratio: 0.0
+          end_ratio: 0.0
+
+  permanent_teacher_routing:
+    description: 训练全程使用GT路由、部署验证仍使用预测路由（exposure-bias诊断，不作为候选方法）
+    comparison: 量化永久teacher supervision造成的训练-推理routing gap
+    overrides:
+      router:
+        teacher_forcing:
+          enabled: true
+          start_ratio: 1.0
+          end_ratio: 1.0
+          decay_epochs: 0
+
+  no_refinement:
+    description: 完全关闭SvANet局部细化
+    comparison: 验证细化分支的净贡献
+    overrides:
+      svanet:
+        enable: false
+      loss:
+        lambda_refine: 0.0
+
+  legacy_roi_fusion:
+    description: 恢复replace-ROI、ROI外清零及full-image fallback
+    comparison: 验证安全ROI融合策略整体贡献
+    overrides:
+      svanet:
+        train_trigger: gt
+        paste_mode: replace_roi
+        outside_roi: zero
+        fusion_weight: 1.0
+        empty_mask_fallback: box_then_full_image
+        confidence_gate_during_training: false
+
+  uniform_balance:
+    description: 将经验batch-prior匹配改为均匀负载均衡
+    comparison: 验证非均匀医学类别先验下的prior regularization
+    overrides:
+      moe:
+        router_regularizer: uniform
+
+  no_router_regularizer:
+    description: 关闭路由分布正则
+    comparison: 验证batch-prior正则的贡献
+    overrides:
+      moe:
+        router_regularizer: none
+      loss:
+        lambda_load_balance: 0.0
+
+  fixed_expert_scale:
+    description: 专家残差缩放固定为0.1而不学习
+    comparison: 验证projection-wise learnable residual scale
+    overrides:
+      moe:
+        learnable_residual_scale: false
+
+  no_expert_delta:
+    description: 保留路由监督但将所有专家残差严格置零
+    comparison: 验证MoE专家本身相对shared SAM3/LoRA路径的净贡献
+    overrides:
+      moe:
+        residual_scale_init: 0.0
+        learnable_residual_scale: false
+
+  layer6_qv_only:
+    description: 仅decoder第6层cross-attention Q/V注入专家
+    comparison: 验证MoE深度范围
+    overrides:
+      moe:
+        decoder_layers: [6]
+
+  layers456_all_attention:
+    description: decoder 4-6层self/cross attention全部投影注入专家
+    comparison: 验证Q/V稀疏注入是否优于更宽模块范围
+    overrides:
+      moe:
+        target_modules:
+          - self_attn.q_proj
+          - self_attn.k_proj
+          - self_attn.v_proj
+          - self_attn.out_proj
+          - ca_text.q_proj
+          - ca_text.k_proj
+          - ca_text.v_proj
+          - ca_text.out_proj
+          - cross_attn.q_proj
+          - cross_attn.k_proj
+          - cross_attn.v_proj
+          - cross_attn.out_proj
+
+  confidence_top2_all:
+    description: 所有非fallback样本固定使用Top-2软路由
+    comparison: 区分自适应置信度策略与单纯增加专家数
+    overrides:
+      moe:
+        confidence_low_threshold: 0.0
+        confidence_high_threshold: 1.0
+        confidence_top_k: 2
+
+  unsafe_full_image_fallback:
+    description: locator与box失败时回退到整幅图细化
+    comparison: 单独验证skip而非full-image fallback
+    overrides:
+      svanet:
+        empty_mask_fallback: locator_then_box_then_full_image
+
+  hard_replace_inside_roi:
+    description: ROI内硬替换但ROI外保留SAM3
+    comparison: 单独验证blended fusion相对hard replacement
+    overrides:
+      svanet:
+        paste_mode: replace_roi
+        outside_roi: sam3
+
+  no_confidence_gate_refine:
+    description: 小目标分类置信度低时仍执行局部细化
+    comparison: 单独验证refinement confidence gate
+    overrides:
+      svanet:
+        min_area_confidence: 0.0
+        confidence_gate_during_training: false
+
+  expert_rank4:
+    description: 将每个LoRA专家rank从8减为4，同时保持alpha/rank=2
+    comparison: 专家容量敏感性（低容量）
+    overrides:
+      moe:
+        rank: 4
+        alpha: 8
+
+  expert_rank16:
+    description: 将每个LoRA专家rank从8增为16，同时保持alpha/rank=2
+    comparison: 专家容量敏感性（高容量）
+    overrides:
+      moe:
+        rank: 16
+        alpha: 32
+
+  locator_dim64:
+    description: 将image locator隐藏维度从128减为64
+    comparison: locator容量敏感性（低容量）
+    overrides:
+      moe:
+        locator_hidden_dim: 64
+
+  locator_dim256:
+    description: 将image locator隐藏维度从128增为256
+    comparison: locator容量敏感性（高容量）
+    overrides:
+      moe:
+        locator_hidden_dim: 256
+
+  conservative_confidence:
+    description: 提高置信度阈值以增加shared fallback和Top-2比例
+    comparison: confidence policy阈值敏感性（保守）
+    overrides:
+      moe:
+        confidence_low_threshold: 0.50
+        confidence_high_threshold: 0.80
+
+  permissive_confidence:
+    description: 降低置信度阈值以增加Top-1专家执行比例
+    comparison: confidence policy阈值敏感性（激进）
+    overrides:
+      moe:
+        confidence_low_threshold: 0.20
+        confidence_high_threshold: 0.60
+
+  teacher_decay5:
+    description: teacher routing在5个epoch内衰减至零
+    comparison: teacher schedule长度敏感性（短）
+    overrides:
+      router:
+        teacher_forcing:
+          decay_epochs: 5
+
+  teacher_decay20:
+    description: teacher routing在20个epoch内衰减至零
+    comparison: teacher schedule长度敏感性（长）
+    overrides:
+      router:
+        teacher_forcing:
+          decay_epochs: 20
+
+  fusion_weight020:
+    description: SvANet安全融合权重设为0.20
+    comparison: refinement强度敏感性（弱）
+    overrides:
+      svanet:
+        fusion_weight: 0.20
+
+  fusion_weight070:
+    description: SvANet安全融合权重设为0.70
+    comparison: refinement强度敏感性（强）
+    overrides:
+      svanet:
+        fusion_weight: 0.70
+
+suites:
+  smoke:
+    - full_v2
+    - parallel_router
+  primary:
+    - full_v2
+    - parallel_router
+    - prompt_conditioned_no_locator
+    - prompt_rich_training
+    - image_only_training
+    - fixed_top1
+    - no_teacher_routing
+    - permanent_teacher_routing
+    - no_refinement
+    - legacy_roi_fusion
+    - uniform_balance
+    - no_router_regularizer
+    - fixed_expert_scale
+    - no_expert_delta
+    - layer6_qv_only
+    - layers456_all_attention
+  refinement:
+    - full_v2
+    - no_refinement
+    - legacy_roi_fusion
+    - unsafe_full_image_fallback
+    - hard_replace_inside_roi
+    - no_confidence_gate_refine
+  routing:
+    - full_v2
+    - parallel_router
+    - prompt_conditioned_no_locator
+    - decoder_memory_routing_source
+    - fixed_top1
+    - confidence_top2_all
+    - no_teacher_routing
+    - permanent_teacher_routing
+    - uniform_balance
+    - no_router_regularizer
+  capacity:
+    - full_v2
+    - no_expert_delta
+    - expert_rank4
+    - expert_rank16
+    - locator_dim64
+    - locator_dim256
+    - layer6_qv_only
+    - layers456_all_attention
+  sensitivity:
+    - full_v2
+    - conservative_confidence
+    - permissive_confidence
+    - teacher_decay5
+    - teacher_decay20
+    - fusion_weight020
+    - fusion_weight070
+  all: ["*"]

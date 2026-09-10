@@ -1,0 +1,53 @@
+# Dedicated prompt-evaluation configuration.
+# Relative paths are resolved from the directory where the test command runs;
+# run test_moe_sam3_prompts.py from MedSAM3-main as shown below.
+base_config: moe_sam3_stage5_direct.yaml
+
+evaluation:
+  # none, text, coarse_box, box, text_box may be enabled independently.
+  # The caller supplies only the slice. SAM3 internally uses this fixed task
+  # token, with no sample-specific text or box.
+  prompt_modes:
+    - none
+    - text
+    - coarse_box
+    - box
+    - text_box
+  none_text: prostate
+
+  # mixed = MR + US; other supported values are mr and us.
+  data_mode: mixed
+  split: test
+  output_dir: outputs/stage5_direct_gpu3/prompt_eval
+
+  # In mixed mode max_patients applies separately to MR and US (N MR + N US).
+  # Per-modality values take precedence when they are not null.
+  max_patients: 5
+  mr_max_patients: null
+  us_max_patients: null
+  max_slices_per_patient: null
+  max_samples: null
+  patient_sampling_mode: sequential
+  patient_seed: 42
+
+  batch_size: 1
+  num_workers: 0
+  threshold: 0.5
+  # Test-time box perturbation. Applied only to box and text_box modes.
+  # Each XYXY coordinate receives Gaussian noise scaled by box width/height,
+  # then the coordinate offset is clipped to +/- box_noise_max pixels.
+  box_noise_std: 0.1
+  box_noise_max: 10
+  box_noise_seed: 42
+  # Coarse-box mode exactly mirrors the deployment-style training curriculum.
+  coarse_box_expand_min: 0.15
+  coarse_box_expand_max: 0.45
+  coarse_box_jitter_std: 0.10
+  coarse_box_jitter_max: 20
+  # Used only if an area class label cannot be derived from saved thresholds.
+  small_area_threshold: 0.01
+  # [row_spacing, column_spacing] in mm; null reports HD95 in pixels.
+  spacing_yx: null
+  save_masks: true
+  require_ground_truth: true
+  log_interval: 10

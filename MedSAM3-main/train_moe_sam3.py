@@ -11,6 +11,7 @@ import os
 import yaml
 
 from models.wandb_logger import add_wandb_arguments, resolve_wandb_settings
+from models.runtime_config import resolve_moe_runtime_config
 from train_sam3_lora_native import (
     SAM3TrainerNative,
     launch_distributed_training,
@@ -50,15 +51,13 @@ def main():
     with open(args.config, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     wandb_settings = resolve_wandb_settings(args, config)
-    moe_config = dict(config.get("moe") or {})
+    moe_config = resolve_moe_runtime_config(config)
     if not moe_config or not moe_config.get("enabled", True):
         raise ValueError("train_moe_sam3.py requires moe.enabled=true")
     router_config = config.get("router") or {}
     training_stage = int(
         args.stage if args.stage is not None else config.get("training", {}).get("stage", 1)
     )
-    if "routing_type" in router_config:
-        moe_config["routing_mode"] = str(router_config["routing_type"]).lower()
     trainer = SAM3TrainerNative(
         args.config,
         multi_gpu=(num_devices > 1 and is_torchrun),

@@ -288,7 +288,7 @@ class IABCEMdetr(LossWithWeights):
         use_presence=False,
         use_presence_semgseg=False,  # If True, use presence scores from the semgseg head.
         presence_alpha=0.5,
-        presence_gamma=0.0,
+        presence_gamma=2.0,
         pos_focal: bool = False,  # for box scores, use focal loss for positives as well
     ):
         super().__init__(weight_dict, compute_aux)

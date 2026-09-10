@@ -1,4 +1,6 @@
-# Complete Hierarchical LoRA-MoE-SAM3 configuration.
+# Direct Stage 5 joint-training configuration.
+# Stage 1-4 checkpoints are intentionally empty: all Stage 5 trainable groups
+# start from their normal SAM3/SvANet initialization instead of staged weights.
 
 model:
   sam3_checkpoint: /mnt/afs/zhemin/zjx/Project/sam3/checkpoint/sam3.pt
@@ -51,10 +53,6 @@ router:
     decay_epochs: 20
 
 dataset:
-  # Training-only XYXY box perturbation. Std is relative to box width/height;
-  # each coordinate offset is then clipped to this many pixels.
-  box_noise_std: 0.0
-  box_noise_max: null
   mr_image_root: ""
   mr_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d"
   mr_mask_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-mask-2d"
@@ -84,8 +82,6 @@ dataset:
   patient_ids:
     mr: []
     us: []
-  # Validation selection is fixed for reproducible best-checkpoint comparison.
-  # null means all patients in the val split; explicit IDs take priority.
   num_mr_val_patients: 35
   num_us_val_patients: 35
   val_patient_ids:
@@ -115,6 +111,8 @@ dataset:
     threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/boundary_thresholds.json
 
 loss:
+  # Scales the complete native Sam3LossWrapper core loss (classification/
+  # presence, box L1/GIoU, native mask focal and mask Dice).
   lambda_sam3: 1.0
   lambda_aux: 1.0
   lambda_modality: 1.0
@@ -138,7 +136,7 @@ svanet:
   roi_expand_ratio: 0.25
   min_roi_size: 32
   mask_threshold: 0.5
-  train_trigger:  gt
+  train_trigger: gt
   empty_mask_fallback: box_then_full_image
   paste_mode: replace_roi
   outside_roi: zero
@@ -146,12 +144,13 @@ svanet:
   gt_roi_warmup_epochs: 25
 
 optimizer:
-  shared_lora_lr: 0.00005
-  expert_lora_lr: 0.0001
-  router_lr: 0.0001
-  auxiliary_head_lr: 0.0001
-  svanet_lr: 0.00001
-  decoder_lr: 0.00001
+  # Conservative learning rates for direct, non-staged joint training.
+  shared_lora_lr: 0.00001
+  expert_lora_lr: 0.00001
+  router_lr: 0.00001
+  auxiliary_head_lr: 0.00001
+  svanet_lr: 0.000001
+  decoder_lr: 0.000001
   weight_decay: 0.0001
 
 stages:
@@ -159,20 +158,22 @@ stages:
   use_aux_loss_stage1: true
   train_router_stage3: false
   use_router_losses_stage3: false
-  train_shared_lora_stage5: false
+  # Stage 1 is skipped, so train shared LoRA during direct Stage 5.
+  train_shared_lora_stage5: true
 
 training:
-  stage: 2
-  epochs: 25
-  num_epochs: 25
-  batch_size: 8
-  num_workers: 4
-  learning_rate: 0.00005
+  stage: 5
+  # Run three epochs first; extend only after checking stability and validation.
+  epochs: 3
+  num_epochs: 3
+  batch_size: 4
+  num_workers: 0
+  learning_rate: 0.00001
   weight_decay: 0.0001
   data_dir: ""
   amp: false
-  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3_noise
-  resume: ""
+  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_directgpu2  # Direct Stage 5 must not resume a Stage 4 checkpoint.
+  resume: null
   log_interval: 10
   validation_interval: 1
   scheduler:
@@ -181,16 +182,22 @@ training:
     eta_min: 0.0
 
 output:
-  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3_noise
+  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct_gpu2
+
 wandb:
-  use_wandb: false
+  use_wandb: true
   wandb_project: HMOE-SAM3
   wandb_entity: null
-  wandb_name: null
-  wandb_group: null
-  wandb_tags: []
+  wandb_name: stage5-direct_gpu2
+  wandb_group: direct-stage5
+  wandb_tags:
+    - stage5
+    - direct-training
+    - joint
+    - sam3
+    - svanet
   wandb_mode: online
-  wandb_dir: ./wandb
+  wandb_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/stage5_direct/wandb
   wandb_log_interval: 10
   wandb_watch_model: false
   wandb_resume: allow

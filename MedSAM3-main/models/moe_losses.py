@@ -136,6 +136,36 @@ def extract_matched_masks(
     return final_logits, target_masks, aux_logits
 
 
+def extract_matched_locator_logits(
+    output: Dict[str, Any],
+    target: Dict[str, Any],
+    locator_logits: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Gather one image-only locator logit map for every matched GT mask."""
+    if locator_logits is None:
+        return None
+    if locator_logits.ndim != 4 or locator_logits.shape[1] != 1:
+        raise ValueError(
+            "image locator logits must have shape [batch,1,H,W], got "
+            f"{tuple(locator_logits.shape)}"
+        )
+    batch_idx, _, target_idx = output["indices"]
+    target_masks = target.get("masks")
+    if target_masks is None:
+        return locator_logits[:0, 0]
+    if batch_idx.numel() and int(batch_idx.max()) >= locator_logits.shape[0]:
+        raise RuntimeError(
+            "Matched batch index exceeds image locator batch: "
+            f"{int(batch_idx.max())} vs {locator_logits.shape[0]}"
+        )
+    selected = locator_logits[batch_idx, 0]
+    valid = target.get("is_valid_mask")
+    if valid is not None:
+        valid = valid if target_idx is None else valid[target_idx]
+        selected = selected[valid]
+    return selected
+
+
 class HierarchicalMoELoss(nn.Module):
     """Compose staged losses around SAM3's native core loss.
 
@@ -159,6 +189,7 @@ class HierarchicalMoELoss(nn.Module):
         routes: Dict[str, torch.Tensor],
         routing_losses: Dict[str, torch.Tensor],
         area_ratio_gt: torch.Tensor,
+        locator_logits: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if not torch.is_tensor(sam3_core_loss):
             raise TypeError("sam3_core_loss must be a differentiable torch.Tensor")
@@ -179,6 +210,17 @@ class HierarchicalMoELoss(nn.Module):
             if aux_logits is not None and aux_logits.shape[0] > 0
             else zero
         )
+        # A zero coefficient is used by the no-locator ablation.  Do not build
+        # an external autograd path for a deliberately inactive head merely to
+        # multiply it by zero later.  Besides avoiding wasted work, this keeps
+        # DDP's post-forward auxiliary-loss contract explicit.
+        locator_loss = (
+            dice_bce_with_logits(locator_logits, gt_masks)
+            if self.weights.get("locator_loss", 0.0) != 0.0
+            and locator_logits is not None
+            and locator_logits.shape[0] > 0
+            else zero
+        )
         area_ratio_gt = area_ratio_gt.to(
             device=routes["area_ratio_pred"].device, dtype=torch.float32
         )
@@ -190,6 +232,7 @@ class HierarchicalMoELoss(nn.Module):
             # SAM3 core loss (box, GIoU, classification/presence and masks).
             "sam3_loss": sam3_core_loss,
             "aux_loss": aux_loss,
+            "locator_loss": locator_loss,
             "modality_loss": routing_losses["modality_loss"],
             "area_loss": routing_losses["area_loss"],
             "area_reg_loss": area_reg_loss,

@@ -26,13 +26,13 @@ STAGE_CHECKPOINTS = {
 STAGE_ACTIVE_LOSSES = {
     1: {"sam3_loss", "aux_loss"},
     2: {
-        "aux_loss", "modality_loss", "area_loss", "area_reg_loss",
+        "aux_loss", "locator_loss", "modality_loss", "area_loss", "area_reg_loss",
         "boundary_router_loss",
     },
     3: {"sam3_loss", "boundary_seg_loss", "load_balance_loss"},
     4: {"refine_loss"},
     5: {
-        "sam3_loss", "aux_loss", "modality_loss", "area_loss",
+        "sam3_loss", "aux_loss", "locator_loss", "modality_loss", "area_loss",
         "area_reg_loss", "boundary_router_loss", "boundary_seg_loss",
         "load_balance_loss", "refine_loss",
     },
@@ -70,6 +70,15 @@ class StageTrainingManager:
         controller_ids = _parameter_ids(self.controller)
         svanet_ids = _parameter_ids(self.svanet_adapter)
         expert_ids = _parameter_ids(getattr(self.controller, "expert_pool", None))
+        fixed_expert_ids = {
+            id(parameter)
+            for parameter in getattr(
+                getattr(self.controller, "expert_pool", None),
+                "fixed_residual_scale_parameters",
+                (),
+            )
+        }
+        expert_ids -= fixed_expert_ids
         router_module = getattr(self.controller, "router", None)
         router_ids = _parameter_ids(router_module)
         ratio_head = getattr(getattr(router_module, "area_router", None), "ratio_head", None)

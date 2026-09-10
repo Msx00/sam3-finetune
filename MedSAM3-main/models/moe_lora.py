@@ -86,6 +86,60 @@ class ExpertPool(nn.Module):
                 for name in names
             }
         )
+        # Projection-specific gates keep a shared expert pool expressive while
+        # preventing one global expert delta from overwhelming every attention
+        # projection. They live inside ExpertPool so staged training treats
+        # them as expert parameters rather than frozen decoder parameters.
+        self.area_residual_scales = nn.ParameterDict()
+        self.boundary_residual_scales = nn.ParameterDict()
+        self._residual_scale_limits: Dict[str, float] = {}
+        self._fixed_residual_scale_keys = set()
+
+    def register_projection_scales(
+        self,
+        projection_key: str,
+        initial_value: float = 1.0,
+        learnable: bool = True,
+        max_abs_value: float = 1.0,
+    ) -> None:
+        """Register independent area/boundary residual scales for a projection."""
+        if not projection_key or "." in projection_key:
+            raise ValueError("projection_key must be a non-empty ParameterDict-safe name")
+        if projection_key in self.area_residual_scales:
+            return
+        if max_abs_value <= 0:
+            raise ValueError("max_abs_value must be positive")
+        if abs(initial_value) > max_abs_value:
+            raise ValueError("initial residual scale exceeds max_abs_value")
+        initial = torch.tensor(float(initial_value), dtype=torch.float32)
+        self.area_residual_scales[projection_key] = nn.Parameter(
+            initial.clone(), requires_grad=bool(learnable)
+        )
+        self.boundary_residual_scales[projection_key] = nn.Parameter(
+            initial.clone(), requires_grad=bool(learnable)
+        )
+        self._residual_scale_limits[projection_key] = float(max_abs_value)
+        if not learnable:
+            self._fixed_residual_scale_keys.add(projection_key)
+
+    @property
+    def fixed_residual_scale_parameters(self) -> Iterable[nn.Parameter]:
+        """Scales declared fixed by config, even when a stage is trainable."""
+        for key in self._fixed_residual_scale_keys:
+            yield self.area_residual_scales[key]
+            yield self.boundary_residual_scales[key]
+
+    def projection_scale(self, projection_key: str, family: str) -> torch.Tensor:
+        if family == "area":
+            scales = self.area_residual_scales
+        elif family == "boundary":
+            scales = self.boundary_residual_scales
+        else:
+            raise ValueError(f"Unknown expert family: {family}")
+        if projection_key not in scales:
+            raise KeyError(f"No residual scale registered for {projection_key}")
+        limit = self._residual_scale_limits.get(projection_key, 1.0)
+        return scales[projection_key].clamp(min=-limit, max=limit)
 
     @property
     def expert_names(self) -> Iterable[str]:
@@ -119,37 +173,24 @@ class ExpertPool(nn.Module):
             (*x.shape[:-1], self.out_features), device=x.device, dtype=x.dtype
         )
         ddp_zero = None
-        hard_routing = bool(
-            torch.all((joint_weights.detach() == 0) | (joint_weights.detach() == 1))
-        )
         for modality_idx, modality in enumerate(MODALITIES):
             for class_idx, class_name in enumerate(class_names):
                 expert = self.experts[f"{modality}_{family}_{class_name}"]
                 weight = joint_weights[:, modality_idx, class_idx]
-                if hard_routing:
-                    selected = (weight.detach() != 0).nonzero(as_tuple=False).flatten()
-                    if selected.numel() == 0:
-                        # Do not execute an unselected top-1 expert. Its
-                        # parameters normally receive no gradient from this sample.
-                        # Under DDP, keep a zero-valued autograd dependency so
-                        # every rank participates in reduction for every expert
-                        # without paying for an expert forward pass.
-                        if torch.distributed.is_initialized():
-                            zero = expert.A.sum() + expert.B.sum()
-                            ddp_zero = zero if ddp_zero is None else ddp_zero + zero
-                        continue
-                    contribution = expert(x.index_select(0, selected))
-                    selected_weight = weight.index_select(0, selected).to(x.dtype)
-                    selected_weight = selected_weight.view(
-                        selected.numel(), *([1] * (x.ndim - 1))
-                    )
-                    delta = delta.index_add(
-                        0, selected, contribution * selected_weight
-                    )
+                selected = (weight.detach() != 0).nonzero(as_tuple=False).flatten()
+                if selected.numel() == 0:
+                    # Do not execute unselected sparse experts. Under DDP keep
+                    # a zero dependency so every rank reduces every expert.
+                    if torch.distributed.is_initialized():
+                        zero = expert.A.sum() + expert.B.sum()
+                        ddp_zero = zero if ddp_zero is None else ddp_zero + zero
                     continue
-                weight = weight.to(dtype=x.dtype)
-                weight = weight.view(x.shape[0], *([1] * (x.ndim - 1)))
-                delta = delta + expert(x) * weight
+                contribution = expert(x.index_select(0, selected))
+                selected_weight = weight.index_select(0, selected).to(x.dtype)
+                selected_weight = selected_weight.view(
+                    selected.numel(), *([1] * (x.ndim - 1))
+                )
+                delta = delta.index_add(0, selected, contribution * selected_weight)
         if ddp_zero is not None:
             delta = delta + ddp_zero.to(delta.dtype) * 0.0
         return delta
@@ -163,7 +204,15 @@ class RoutedMoELinear(nn.Module):
     the hierarchical experts are additive and must not replace shared LoRA.
     """
 
-    def __init__(self, base_linear: nn.Module, controller: nn.Module) -> None:
+    def __init__(
+        self,
+        base_linear: nn.Module,
+        controller: nn.Module,
+        projection_key: Optional[str] = None,
+        residual_scale_init: float = 1.0,
+        learnable_residual_scale: bool = True,
+        residual_scale_max: float = 1.0,
+    ) -> None:
         super().__init__()
         required = ("in_features", "out_features", "weight", "bias")
         if any(not hasattr(base_linear, name) for name in required):
@@ -179,6 +228,17 @@ class RoutedMoELinear(nn.Module):
         self.out_features = base_linear.out_features
         # Avoid registering the same controller under every projection wrapper.
         object.__setattr__(self, "_controller_ref", weakref.ref(controller))
+        # Direct construction remains supported by assigning a deterministic
+        # key. Injection always supplies a unique layer/attention/projection key.
+        if projection_key is None:
+            projection_key = f"projection_{len(controller.expert_pool.area_residual_scales)}"
+        self.projection_key = str(projection_key).replace(".", "_")
+        controller.expert_pool.register_projection_scales(
+            self.projection_key,
+            initial_value=residual_scale_init,
+            learnable=learnable_residual_scale,
+            max_abs_value=residual_scale_max,
+        )
 
     @property
     def weight(self) -> torch.Tensor:
@@ -204,4 +264,29 @@ class RoutedMoELinear(nn.Module):
         boundary_delta = controller.expert_pool.forward_family(
             x, routes["boundary_joint"], family="boundary"
         )
-        return output + area_delta + boundary_delta
+        area_scale = controller.expert_pool.projection_scale(
+            self.projection_key, family="area"
+        ).to(dtype=area_delta.dtype)
+        boundary_scale = controller.expert_pool.projection_scale(
+            self.projection_key, family="boundary"
+        ).to(dtype=boundary_delta.dtype)
+        output = output + area_scale * area_delta + boundary_scale * boundary_delta
+
+        # ``find_unused_parameters=True`` decides which parameters are reachable
+        # as soon as DDP's wrapped forward returns.  Router supervision is added
+        # only afterwards by the trainer.  If an entire local batch takes the
+        # shared-path fallback, ``forward_family`` deliberately executes no
+        # expert and would otherwise disconnect that family's route tensor from
+        # the returned graph.  DDP would mark the router parameters ready as
+        # unused, then fail when the post-forward router loss reaches them.
+        #
+        # Keep a scalar, zero-valued dependency on both joint routes regardless
+        # of sparse execution.  The locator output is included as well: in the
+        # ``use_image_locator=False`` ablation it is intentionally absent from
+        # both joint routes, but an optional external locator loss must still be
+        # safe under DDP.  These anchors do not change forward values.
+        routing_anchor = routes["area_joint"].sum() + routes["boundary_joint"].sum()
+        locator_logits = routes.get("image_locator_logits")
+        if locator_logits is not None:
+            routing_anchor = routing_anchor + locator_logits.sum()
+        return output + routing_anchor.to(dtype=output.dtype) * 0.0

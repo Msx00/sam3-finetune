@@ -1,0 +1,306 @@
+HMoE-SAM3 方法改造与消融实验技术报告
+====================================
+
+生成日期：2026-09-10
+工程目录：/home/data/mashixing/Project/SAM3-ICRA/mysam_now_optimize/mysam
+
+
+一、任务目标与结论
+------------------
+
+本次改造解决的核心问题是：部署时外部输入只有一张医学图像 slice，没有 GT mask、GT bbox、
+模态标签、面积标签或边界标签时，模型仍应能够独立完成专家路由和分割；训练期使用的标签只可
+作为监督信号或有限期 teacher forcing，不能成为推理依赖。
+
+改造后的模型可以准确称为“图像驱动的条件式 Hierarchical Mixture of Experts（HMoE）”：
+
+  p(m, a | I) = p(m | I) p(a | m, I)
+  p(m, b | I) = p(m | I) p(b | m, I)
+
+其中 I 是 prompt 融合前的图像 FPN 特征，m 是 MR/US 父路由，a 是 small/medium/large
+面积子路由，b 是 clear/fuzzy/complex 边界子路由。面积专家和边界专家是父节点下的两个
+条件式兄弟分支，它们以残差形式并行加入 SAM3 解码器；因此它是条件概率意义上的真正层次
+路由，而不是把三个独立分类器简单命名为 HMoE。它也不是“面积之后再按边界继续分裂”的三层
+串行专家树，论文中应避免这样描述。
+
+模型不能在数学上保证每张未知域 slice 都路由正确。当前实现采用“监督学习提高正确率 +
+不确定性回退降低错误路由代价”的工程闭环：高置信度执行 Top-1，中等置信度执行联合后验
+Top-2，低置信度不执行专属专家而回到 shared SAM3/LoRA 路径。是否达到“高概率正确”必须用
+独立患者测试集上的路由准确率、校准误差和分割指标验证，不能仅由结构名称推出。
+
+
+二、原实现的主要方法风险
+------------------------
+
+1. 若面积、边界路由与模态路由互相独立，则只构成并行多任务路由，不是严格条件式 HMoE。
+
+2. 若路由输入取自已经融合 text/bbox 的 decoder memory 或 query，则训练时即使路由准确，
+   也可能只是利用 GT prompt；无提示部署会产生明显 train-test gap。
+
+3. 若训练长期使用 GT modality/area/boundary route，专家只在 oracle 路径上优化，推理改用
+   预测路由后会出现 exposure bias。
+
+4. 若小目标 ROI 永久由 GT mask/GT bbox 决定，SvANet 在真实推理时没有可靠 ROI 来源。
+
+5. 旧 ROI 融合会在 ROI 外清零，或在定位失败时用整幅图运行局部细化器；这可能破坏本来已经
+   表现良好的 SAM3 结果。
+
+6. 固定 residual scale 在训练阶段可能被统一解冻，导致“fixed scale/no expert delta”消融
+   实际没有执行声明的方法。
+
+7. 训练、测试分别解析 model/moe/router 配置容易构造不同网络；恢复训练状态也可能被测试
+   配置中的 resume 字段意外触发。
+
+8. 当一个 DDP rank 的整批样本都进入 shared fallback 时，稀疏专家前向原本会切断 route
+   tensor 到模型输出的计算图；find_unused_parameters=True 先把 router 标成 unused，随后训练器
+   在 forward 外加入 router loss，会触发“Expected to mark a variable ready only once”。最终实现
+   为 area/boundary joint route 和 locator 增加零值图锚，并在 locator 权重为零时不构建外置 loss
+   图，从而覆盖默认双卡训练的这一真实阻断路径。
+
+
+三、最终方法设计
+----------------
+
+3.1 严格图像路由
+
+- 路由特征默认设为 moe.routing_feature_source=backbone_fpn。
+- 从 Sam3DualViTDetNeck.convs 中捕获与 decoder 第一 memory level 对应的原始 FPN 输出：
+  index = len(convs) - scalp - num_feature_levels。
+- 该特征产生于 forward_text 和几何提示融合之前，不包含 sample-specific text/bbox。
+- find_input.img_ids 用于把图像 batch 精确对齐到 query batch；索引、batch、device 或空间尺寸
+  不一致时立即报错，不进行静默回退。
+- q3 仍生成 coarse_mask_p3 辅助分割输出，但默认路由分类不读取 q3，也不读取 prompt-conditioned
+  decoder memory。
+- decoder_memory 旧路径被明确保留为泄漏诊断消融，不是主方法默认值。
+
+3.2 图像定位器与条件层次路由
+
+- 新增轻量 ImageLocator，在原始 FPN 上预测 prompt-independent 粗前景 logits。
+- locator 使用 Dice+BCE 监督，给面积与边界路由提供软 ROI 统计；路由同时使用全局图像特征，
+  避免 locator 早期不稳定时完全丢失上下文。
+- 父路由输出 p(modality|image)。每个子路由输出 [B,2,3]，即针对 MR/US 的条件分布。
+- 实际专家 gate 为父、子概率乘积 [B,2,3]，而不是先把两个模态边缘化成一个 [B,3] 再选专家。
+- 子路由交叉熵在 GT 模态对应的条件分支上计算；teacher parent route 后会重新计算同一个一致的
+  joint route，避免父子标签来自不同路径。
+
+3.3 置信度感知的稀疏执行
+
+- 每个面积/边界路径的置信度取预测父模态置信度和该父分支子类别置信度的较小值。
+- canonical 配置：confidence_low_threshold=0.35，confidence_high_threshold=0.70，Top-K=2。
+- 高置信度：只执行一个联合专家；中等置信度：执行联合后验最高的两个专家；低置信度：专属
+  expert gate 前向值为零，仅使用 frozen/shared 基础路径。
+- shared fallback 不再被统计成虚假的 MR-small 或 MR-clear 专家。
+- 每个投影的面积/边界残差缩放相互独立，初值 0.1、绝对值上限 1.0，避免专家初期破坏已有
+  in-domain 能力。
+
+3.4 路由监督与部署一致训练
+
+- router teacher forcing 从 0.5 线性衰减到 0，epoch 10 后训练完全使用预测路由。
+- GT 标签仅用于 modality/area/boundary/area-ratio/locator loss；eval/inference 显式设置
+  routing_targets=None。
+- 负载正则从不符合真实医学分布的“强制均匀”改为匹配当前 batch 经验先验；模态分布不被强制
+  拉成 1:1。
+- prompt curriculum 的起始概率为 image_only/text/coarse_box/accurate_box =
+  0.30/0.10/0.40/0.20，20 个 epoch 后为 0.70/0.10/0.20/0.00。
+- image_only 只使用全任务固定 token“prostate”，不使用样本级 bbox/text 标签；coarse_box 是
+  扩张并抖动的训练提示，accurate_box 最终降为零。
+- 固定 task token 是 SAM3 grounding 接口内部的任务定义，不是 GT prompt。对当前单器官任务，
+  外部调用仍只有 slice；若未来一个模型同时分割多个可能目标，调用方必须提供任务名，单张图像
+  本身无法定义“用户想分割哪一个器官”。
+
+3.5 安全的小目标细化
+
+- SvANet 本体结构不变，只在适配器外完成 ROI 选择和 logits 融合。
+- GT ROI teacher forcing 同样从 0.5 衰减到 0；推理只允许 SAM3 mask、image locator、可选粗框
+  的可靠候选。
+- 默认 fallback 链为 locator -> box -> skip。没有可靠 ROI 时保留 SAM3 输出，不再默认整图细化。
+- 对连通域像素数、最大面积比例、SAM3/locator 置信度及 small-area 路由置信度进行门控。
+- 默认 ROI 内采用 0.35 权重的 logit convex blend，ROI 外保持 SAM3；旧 replace/zero 行为只留作
+  消融。
+- 增加输入 batch、area logits、teacher mask、GT mask 和 locator shape 的 fail-closed 校验。
+
+
+四、纯 slice 推理协议
+--------------------
+
+infer_moe_sam3.py 新增：
+
+  --image PATH
+  --image-dir DIRECTORY
+  --task-text prostate
+
+--image 与 --image-dir 互斥。目录模式递归发现支持的图像并稳定排序。raw slice 入口只读取图片，
+resize 到 1008×1008，并按训练相同的 mean/std=0.5 归一化。构造的 Datapoint 满足：
+
+- images.objects=[]；
+- object_ids_output=[]；
+- input_bbox/input_points/semantic_target=None；
+- raw_images=None；
+- 不读取 annotation、mask、modality、area 或 boundary 文件；
+- collate_fn_api(..., with_seg_masks=False)；
+- 模型的 num_interactive_steps_val 强制为 0；
+- forward 前后均不设置路由 GT target。
+
+为兼容已有批量输出，--split 入口仍可读取数据集索引，但进入模型前会重新构造为固定 task token、
+零框、零 object target 的 Datapoint。mask_path 等只保留在模型外 metadata 中用于评估和落盘。
+
+示例（在 MedSAM3-main 下）：
+
+  python infer_moe_sam3.py \
+    --checkpoint /path/to/stage5_joint_best.pt \
+    --image /path/to/slice.png \
+    --output-dir outputs/single_slice
+
+  python infer_moe_sam3.py \
+    --checkpoint /path/to/stage5_joint_best.pt \
+    --image-dir /path/to/slices \
+    --task-text prostate \
+    --output-dir outputs/slice_directory
+
+注意：旧 checkpoint 没有新 locator/条件子路由参数。虽然 strict=False 可完成结构迁移，但不能把
+未训练的新参数 checkpoint 当作 V2 结果；必须用当前配置重新训练或至少充分微调后再评估。
+
+
+五、代码结构与启动入口
+----------------------
+
+mysam 顶层目前仅保留两个 shell 启动入口：
+
+  train.sh   唯一真实训练入口，默认 Stage 5 direct、GPU 0/1，可用 CONFIG/GPU_IDS/RESUME 覆盖。
+  test.sh    唯一正式测试入口，同时评估 none/text/coarse_box/box/text_box。
+
+服务器执行：
+
+  bash train.sh
+  CHECKPOINT=/mnt/.../stage5_joint_best.pt bash test.sh
+  bash ablation/run.sh
+
+删除了顶层 1.sh、2.sh、debug*.sh、run.sh 等重复入口。MedSAM3-main 与 SvANet-main 内部的上游、
+工具或第三方 shell 文件被保留，因为它们属于子工程资产，不是 mysam 顶层启动入口。
+
+关键实现文件：
+
+- MedSAM3-main/models/router.py：locator、父/条件子路由、置信度策略和 joint gates。
+- MedSAM3-main/models/moe_injector.py：原始 FPN 捕获、img_ids 对齐、teacher joint route、模块注入。
+- MedSAM3-main/models/moe_lora.py：12 个共享 LoRA expert 与 projection-wise residual scales。
+- MedSAM3-main/models/moe_losses.py：Hungarian 对齐的 locator/aux/boundary/router 损失。
+- MedSAM3-main/models/runtime_config.py：训练/测试/推理统一解析 MoE 配置。
+- MedSAM3-main/data/patient_dataset.py：可复现 prompt curriculum 和粗框生成。
+- MedSAM3-main/models/svanet_roi_adapter.py：可靠 ROI 选择、安全回退和融合。
+- MedSAM3-main/train_sam3_lora_native.py：训练集成、seed、日志、统计与阶段管理。
+- MedSAM3-main/test_moe_sam3_prompts.py：严格去除 GT target 的多提示协议测试。
+- MedSAM3-main/infer_moe_sam3.py：真正只读 raw slice 的部署入口。
+- MedSAM3-main/tests/test_moe_ddp.py：shared fallback 下的双卡图可达性回归。
+- MedSAM3-main/configs/moe_sam3_stage5_direct.yaml：唯一 train.sh 默认主配置。
+
+用户已有的 /mnt/afs 数据、COCO JSON、threshold、SAM3/SvANet checkpoint 路径没有被替换。
+消融配置生成器还会比较并锁定所有数据/权重路径，任何实验 override 改动这些路径都会立即失败。
+
+
+六、科学消融实验
+----------------
+
+实现目录：mysam/ablation/
+
+  run.sh                   远端消融启动入口，复用训练环境并支持单卡/多卡实验队列
+  study.yaml                参照方法、单因素变体、suite 与 seed
+  run_ablation.py           list/validate/generate/run，多 GPU 队列与断点状态
+  summarize_ablation.py     指标抽取、配对统计、CSV/Markdown 报告
+  ablation_lib.py           路径保护、配置合并、统计实现
+  test_ablation.py          配置、路径、日志格式与统计单元测试
+  README.md                 完整操作说明与结论边界
+
+当前矩阵含 31 个方法（含 full_v2）× 3 个默认 seed = 93 个训练 cell，并按以下问题分组：
+
+1. 层次结构：parallel_router 对比 conditional hierarchy。
+2. 图像路由：关闭 locator；backbone_fpn 对比 decoder_memory 泄漏诊断。
+3. prompt 依赖：prompt-rich、全 image-only 与 curriculum。
+4. 路由执行：固定 Top-1、固定 Top-2、adaptive confidence fallback。
+5. teacher exposure：无 teacher、有限期 teacher、永久 teacher（仅作 gap 诊断）。
+6. 正则：batch-prior、uniform、none。
+7. 专家净贡献/容量：no expert delta、固定 scale、rank 4/8/16、注入层和投影范围。
+8. 细化：no SvANet、旧破坏性融合、full-image fallback、hard replace、无 confidence gate。
+9. 敏感性：置信阈值、teacher decay、fusion weight、locator hidden dim。
+
+所有正式验证均固定 prompt_curriculum.evaluation_mode=image_only。decoder_memory 变体只用于证明
+路由源选择，不应作为最终部署方法。permanent teacher 仍在验证时使用预测 route，不是 oracle
+推理上界。
+
+常用命令（在 mysam 下）：
+
+  python ablation/run_ablation.py validate --suite all
+  python ablation/run_ablation.py list --suite primary
+  python ablation/run_ablation.py generate --suite primary --seeds 13 42 73
+
+  python ablation/run_ablation.py run \
+    --suite smoke \
+    --device-sets 0 \
+    --dry-run
+
+  python ablation/run_ablation.py run \
+    --suite primary \
+    --device-sets 0,1 2,3
+
+  python ablation/summarize_ablation.py --suite primary --epoch best
+
+run 命令会维护 state/<suite>.json，完成的 cell 默认跳过；不同 cell 使用独立配置、输出目录和
+日志。汇总器直接兼容训练器真实输出：router_statistics.json 是 JSON array，val_stats.json 是
+JSONL。best 根据最低 val_loss 选择，并关联同 epoch 的完整 router/segmentation/SvANet 统计。
+
+最低报告指标：
+
+- patient-macro Dice/IoU（主指标），slice Dice/IoU；
+- MR/US、small/medium/large、clear/fuzzy/complex 子组 Dice；
+- modality/area/boundary accuracy、entropy、routing confidence；
+- shared/Top-2/Top-1 比例及每个实际执行 expert 的使用次数；
+- SvANet trigger、total skip、low-confidence skip、no-reliable-ROI skip、locator/box/full-image
+  fallback 比例；
+- trainable parameters、吞吐、单 slice P50/P95 latency 与峰值显存（需服务器实测）。
+
+统计策略：方法间使用完全相同 seed 做 paired difference；输出 seed bootstrap 95% CI、双侧
+paired sign-flip randomization p value，并在每个指标族内做 Holm 校正。3 seed 只适合筛选，
+论文确认实验建议至少 5 seed；患者是主要统计单位，正式论文还应在每个 seed 内按 MR/US 分层
+做 patient bootstrap。失败 cell 必须保留在 missing_runs.json 中，不能选择性删除。
+
+
+七、验证结果
+------------
+
+本地 CPU 验证：
+
+- MedSAM3-main/tests：52 passed；其中包含 CPU Gloo、DDP(find_unused_parameters=True)、整批
+  shared fallback 和 post-forward router loss 的专项回归。
+- ablation/test_ablation.py：12 passed。
+- 全消融矩阵 validate：93/93 cell 的数据和 checkpoint 路径保持不变。
+- train.sh、test.sh、ablation/run.sh 通过 bash -n；mysam 顶层 shell 文件数仍为 2。
+- Python 文件通过 py_compile，YAML 可解析，git diff --check 无空白错误。
+
+未执行完整 GPU 训练或真实测试集推理：本地机器没有远端 /mnt/afs 数据与正式 checkpoint，完整
+运行应在用户指定的训练服务器完成。因此本报告中的测试结果证明接口、计算逻辑、配置生成、
+输入隔离和统计程序一致，不等价于宣称新的 Dice/HD95 数值已经提升。
+
+
+八、远端验收与决策标准
+----------------------
+
+1. 先运行 smoke suite，确认 locator_loss 非零且下降，实际 teacher ratio 在 epoch 10 后为 0，
+   shared/Top-2/Top-1 计数之和与样本数一致，且 full-image fallback 为 0。
+
+2. 用纯 image-only 协议分别测试 in-domain 与 cross-domain；checkpoint 与所有阈值一旦选定，
+   不允许按测试域单独调参。
+
+3. 检查 modality/area/boundary 的 reliability diagram、ECE/Brier score，并在 validation 上校准
+   temperature/low/high threshold。当前 temperature=1 和阈值是合理初值，不应未经校准写成
+   “保证正确”。
+
+4. 只有当 full_v2 在 patient-macro Dice/IoU 上不降低既有 in-domain 能力，同时在 cross-domain
+   或小目标/复杂边界子组上稳定改善，且至少 5 seed 的配对区间支持该方向，才应把改造版本作为
+   最终方法。
+
+5. 如果路由准确率提高但最终 Dice 不升，优先检查 expert specialization 与 residual scale；如果
+   Dice 升但路由标签准确率不升，说明当前人为 area/boundary taxonomy 未必对应最优专家划分，
+   论文结论应聚焦性能和可靠执行，不应过度解释专家语义。
+
+6. 对未知域若 shared fallback 比例异常升高，这是安全策略正常工作但也表明 OOD；后续可加入
+   validation-fitted temperature scaling、deep ensemble/MC-dropout 或显式 OOD head。未经外部数据
+   验证前，不建议增加更复杂专家数量，以免在现有良好 in-domain 表现上过拟合。

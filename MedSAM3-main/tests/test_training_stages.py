@@ -47,6 +47,35 @@ def test_routed_projection_preserves_shared_lora():
     assert torch.allclose(routed(values), base(values))
 
 
+def test_stage_manager_does_not_reenable_fixed_expert_scales():
+    model, controller, _ = build_components(with_svanet=False)
+    RoutedMoELinear(
+        nn.Linear(4, 4),
+        controller,
+        projection_key="fixed_scale",
+        residual_scale_init=0.0,
+        learnable_residual_scale=False,
+    )
+    fixed = list(controller.expert_pool.fixed_residual_scale_parameters)
+    assert len(fixed) == 2
+
+    manager = StageTrainingManager(
+        model,
+        controller,
+        stage=3,
+        optimizer_config={"learning_rate": 1e-3},
+    )
+    optimizer = manager.build_optimizer()
+    optimized = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+
+    assert all(not parameter.requires_grad for parameter in fixed)
+    assert all(id(parameter) not in optimized for parameter in fixed)
+
+
 def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
     expected = {
         1: {"shared_lora"},

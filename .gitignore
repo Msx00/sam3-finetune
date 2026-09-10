@@ -1,0 +1,27 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Training outputs and experiment state
+outputs/
+wandb/
+*.log
+*.pt
+*.pth
+*.ckpt
+ablation/generated/
+ablation/logs/
+ablation/reports/
+ablation/state/
+metrics_per_patient.csv
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
