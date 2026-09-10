@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep these server paths aligned with ../train.sh. The ablation runner inherits
-# every dataset/checkpoint path from the canonical Stage-5 configuration.
-WORKSPACE_ROOT="/mnt/afs/zhemin/zjx/Project/mysam"
-PROJECT_ROOT="${WORKSPACE_ROOT}/MedSAM3-main"
-ABLATION_ROOT="${WORKSPACE_ROOT}/ablation"
-CONDA_SH="/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV="sam3"
+# Resolve code relative to this script. The ablation runner still inherits all
+# dataset/checkpoint paths from the canonical Stage-5 configuration.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
+PROJECT_ROOT="${PROJECT_ROOT:-${WORKSPACE_ROOT}/MedSAM3-main}"
+ABLATION_ROOT="${ABLATION_ROOT:-${SCRIPT_DIR}}"
+CONDA_SH="${CONDA_SH:-/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-sam3}"
 
 STUDY="${STUDY:-${ABLATION_ROOT}/study.yaml}"
 SUITE="${SUITE:-primary}"
@@ -32,8 +33,10 @@ conda activate "${CONDA_ENV}"
 
 export HYDRA_FULL_ERROR=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-export CC="/mnt/afs/zhemin/miniconda3/envs/sam3/bin/x86_64-conda-linux-gnu-gcc"
-export CXX="/mnt/afs/zhemin/miniconda3/envs/sam3/bin/x86_64-conda-linux-gnu-g++"
+DEFAULT_CC="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc"
+DEFAULT_CXX="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++"
+[[ ! -x "${DEFAULT_CC}" ]] || export CC="${CC:-${DEFAULT_CC}}"
+[[ ! -x "${DEFAULT_CXX}" ]] || export CXX="${CXX:-${DEFAULT_CXX}}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 read -r -a DEVICE_ARGS <<< "${DEVICE_SETS}"

@@ -195,14 +195,15 @@ python -m pip install -e .
 python -m pip install SimpleITK
 ```
 
-顶层启动脚本面向训练服务器，故保留以下已验证的绝对路径：
+三个正式启动脚本都根据脚本自身位置解析仓库目录，因此可以将仓库克隆到不同服务器路径。
+默认 Conda 初始化位置仍为：
 
 ```text
-/mnt/afs/zhemin/zjx/Project/mysam
-/mnt/afs/zhemin/miniconda3/envs/sam3
+/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh
 ```
 
-本地代码审查机器没有相同的 `/mnt/afs` 数据与 checkpoint，因此不能在本机完成真实 GPU 训练。
+如服务器的 Conda 位置或环境名不同，可在启动时设置 `CONDA_SH`、`CONDA_ENV`。本地代码审查
+机器没有相同的 `/mnt/afs` 数据与 checkpoint，因此不能在本机完成真实 GPU 训练。
 
 ## 5. 数据
 

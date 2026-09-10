@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Server paths are intentionally absolute: this entry is executed on the
-# training server, not from the local checkout used to edit the project.
-PROJECT_ROOT="/mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main"
-CONDA_SH="/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV="sam3"
+# Resolve code relative to this script so the repository can be cloned to any
+# server directory. Dataset/checkpoint paths remain defined by the YAML config.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-${SCRIPT_DIR}/MedSAM3-main}"
+CONDA_SH="${CONDA_SH:-/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-sam3}"
 CONFIG="${CONFIG:-${PROJECT_ROOT}/configs/moe_sam3_stage5_direct.yaml}"
 GPU_IDS="${GPU_IDS:-0 1}"
 RESUME="${RESUME:-}"
@@ -24,8 +25,10 @@ conda activate "${CONDA_ENV}"
 
 export HYDRA_FULL_ERROR=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-export CC="/mnt/afs/zhemin/miniconda3/envs/sam3/bin/x86_64-conda-linux-gnu-gcc"
-export CXX="/mnt/afs/zhemin/miniconda3/envs/sam3/bin/x86_64-conda-linux-gnu-g++"
+DEFAULT_CC="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc"
+DEFAULT_CXX="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++"
+[[ ! -x "${DEFAULT_CC}" ]] || export CC="${CC:-${DEFAULT_CC}}"
+[[ ! -x "${DEFAULT_CXX}" ]] || export CXX="${CXX:-${DEFAULT_CXX}}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 read -r -a DEVICE_ARGS <<< "${GPU_IDS}"

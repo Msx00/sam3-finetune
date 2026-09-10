@@ -193,7 +193,8 @@ mysam 顶层目前仅保留两个 shell 启动入口：
 - MedSAM3-main/tests/test_moe_ddp.py：shared fallback 下的双卡图可达性回归。
 - MedSAM3-main/configs/moe_sam3_stage5_direct.yaml：唯一 train.sh 默认主配置。
 
-用户已有的 /mnt/afs 数据、COCO JSON、threshold、SAM3/SvANet checkpoint 路径没有被替换。
+三个启动脚本从自身位置解析代码目录，支持仓库部署到不同服务器目录；用户已有的 /mnt/afs 数据、
+COCO JSON、threshold、SAM3/SvANet checkpoint 路径没有被替换。
 消融配置生成器还会比较并锁定所有数据/权重路径，任何实验 override 改动这些路径都会立即失败。
 
 

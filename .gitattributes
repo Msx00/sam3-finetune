@@ -1,0 +1,3 @@
+# Bash cannot parse CRLF reliably. Force LF on every checkout, including on
+# servers whose global Git configuration enables core.autocrlf.
+*.sh text eol=lf

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="/mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main"
-CONDA_SH="/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV="sam3"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-${SCRIPT_DIR}/MedSAM3-main}"
+CONDA_SH="${CONDA_SH:-/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-sam3}"
 CONFIG="${CONFIG:-${PROJECT_ROOT}/configs/test.yaml}"
 CHECKPOINT="${CHECKPOINT:-${PROJECT_ROOT}/outputs/stage5_direct_noise/stage5_joint_best.pt}"
 DEVICE="${DEVICE:-0}"
