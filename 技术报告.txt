@@ -269,7 +269,7 @@ paired sign-flip randomization p value，并在每个指标族内做 Holm 校正
 
 本地 CPU 验证：
 
-- MedSAM3-main/tests：58 passed；其中包含 CPU Gloo、DDP(find_unused_parameters=True)、整批
+- MedSAM3-main/tests：59 passed；其中包含 CPU Gloo、DDP(find_unused_parameters=True)、整批
   shared fallback 和 post-forward router loss 的专项回归。
 - ablation/test_ablation.py：12 passed。
 - 全消融矩阵 validate：93/93 cell 的数据和 checkpoint 路径保持不变。

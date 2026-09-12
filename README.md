@@ -549,7 +549,7 @@ paired difference、bootstrap CI、paired sign-flip test 和 Holm 校正。完�
 本地验证结果：
 
 ```text
-MedSAM3-main/tests:       58 passed
+MedSAM3-main/tests:       59 passed
 ablation tests:           12 passed
 ablation path validation: 93/93 cells
 ```

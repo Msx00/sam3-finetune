@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -555,8 +556,9 @@ class SvANetROIAdapter(nn.Module):
         saved tensors until the caller invokes backward. Non-reentrant
         checkpointing stores only the chunk inputs and recomputes SvANet during
         backward, which makes the saved-activation peak approximately one
-        chunk instead of the sum of all chunks. The BatchNorm mode used by a
-        singleton forward is repeated during checkpoint recomputation.
+        chunk instead of the sum of all chunks. The BatchNorm mode and all
+        three RNG streams used by SvANet (Torch, NumPy and Python) are replayed
+        during checkpoint recomputation.
         """
         chunk_size = self.roi_chunk_size
         batch = model_input.shape[0]
@@ -580,16 +582,47 @@ class SvANetROIAdapter(nn.Module):
             if not checkpoint_enabled:
                 return self.svanet(chunk)
 
-            # The outer context below controls the original forward. During
-            # backward it has already exited, so explicitly recreate the same
-            # BatchNorm mode for the non-reentrant recomputation.
-            def checkpoint_contexts():
-                recompute_context = (
+            # SvANet uses NumPy and Python randomness in addition to Torch RNG
+            # (e.g. Monte-Carlo pooling and feature shuffling). PyTorch's
+            # checkpoint utility preserves only Torch RNG, so replay the two
+            # external streams explicitly. Otherwise the recomputed graph can
+            # take a different branch and save a different number of tensors.
+            external_rng_state: Dict[str, Any] = {}
+
+            @contextlib.contextmanager
+            def original_context() -> Iterator[None]:
+                external_rng_state["python"] = random.getstate()
+                external_rng_state["numpy"] = np.random.get_state()
+                batch_norm_context = (
+                    self._singleton_batch_norms((1,))
+                    if singleton_bn_mode
+                    else contextlib.nullcontext()
+                )
+                with batch_norm_context:
+                    yield
+
+            @contextlib.contextmanager
+            def recompute_context() -> Iterator[None]:
+                python_state = random.getstate()
+                numpy_state = np.random.get_state()
+                random.setstate(external_rng_state["python"])
+                np.random.set_state(external_rng_state["numpy"])
+                batch_norm_context = (
                     self._singleton_batch_norms((1,))
                     if singleton_bn_mode
                     else self._batch_norm_recompute()
                 )
-                return contextlib.nullcontext(), recompute_context
+                try:
+                    with batch_norm_context:
+                        yield
+                finally:
+                    # Recompute is an autograd implementation detail and must
+                    # not advance application-level augmentation/routing RNG.
+                    random.setstate(python_state)
+                    np.random.set_state(numpy_state)
+
+            def checkpoint_contexts():
+                return original_context(), recompute_context()
 
             return activation_checkpoint(
                 self.svanet,
@@ -599,8 +632,11 @@ class SvANetROIAdapter(nn.Module):
                 context_fn=checkpoint_contexts,
             )
 
-        with self._singleton_batch_norms(chunk_sizes):
+        if checkpoint_enabled:
             outputs = [run_chunk(chunk) for chunk in chunks]
+        else:
+            with self._singleton_batch_norms(chunk_sizes):
+                outputs = [run_chunk(chunk) for chunk in chunks]
         if len(outputs) == 1:
             return outputs[0]
         if all(isinstance(output, torch.Tensor) for output in outputs):

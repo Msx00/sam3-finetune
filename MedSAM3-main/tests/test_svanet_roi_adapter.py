@@ -1,5 +1,8 @@
 """Focused tests for safe SvANet ROI proposal and fusion."""
 
+import random
+
+import numpy as np
 import torch
 from torch import nn
 
@@ -49,6 +52,27 @@ class RecordingSvANet(ConstantSvANet):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         self.last_input = images.detach().clone()
         return super().forward(images)
+
+
+class ExternalRNGSvANet(nn.Module):
+    """Mimic SvANet branches driven by NumPy and Python randomness."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(3, 2, kernel_size=1)
+        self.optional_projection = nn.Conv2d(2, 2, kernel_size=1)
+        self.decisions = []
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        branch = int(np.random.choice([0, 1]))
+        scale = random.random()
+        self.decisions.append((branch, scale))
+        output = self.projection(images)
+        if branch:
+            # This branch saves a different number of autograd tensors, just
+            # like SvANet's stochastic Monte-Carlo feature paths.
+            output = torch.relu(self.optional_projection(output))
+        return output * (0.5 + scale)
 
 
 def _small_area_logits(batch: int = 1) -> torch.Tensor:
@@ -329,6 +353,51 @@ def test_checkpoint_recompute_does_not_update_batch_norm_running_stats_twice() -
     assert model.batch_norm_tracking_states == [True, True]
     assert model.batch_norm.track_running_stats
     assert model.batch_norm.num_batches_tracked.item() == 1
+
+
+def test_checkpoint_replays_numpy_and_python_rng_without_advancing_them() -> None:
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    try:
+        random.seed(0)
+        np.random.seed(0)
+        model = ExternalRNGSvANet()
+        adapter = _adapter(
+            model,
+            roi_chunk_size=1,
+            activation_checkpointing=True,
+        )
+        adapter.train()
+        images = torch.randn(1, 3, 8, 8)
+        sam3 = torch.full((1, 8, 8), -10.0)
+        gt = torch.zeros(1, 8, 8)
+        gt[:, 2:6, 3:7] = 1.0
+
+        output = adapter(
+            images,
+            sam3,
+            _small_area_logits(),
+            area_labels=torch.zeros(1, dtype=torch.long),
+            teacher_area_mask=torch.ones(1, dtype=torch.bool),
+            gt_masks=gt,
+            use_gt_roi=True,
+        )
+        python_after_forward = random.getstate()
+        numpy_after_forward = np.random.get_state()
+
+        output["refine_loss"].backward()
+
+        assert len(model.decisions) == 2
+        assert model.decisions[0] == model.decisions[1]
+        assert random.getstate() == python_after_forward
+        numpy_after_backward = np.random.get_state()
+        assert numpy_after_backward[0] == numpy_after_forward[0]
+        assert np.array_equal(numpy_after_backward[1], numpy_after_forward[1])
+        assert numpy_after_backward[2:] == numpy_after_forward[2:]
+        assert model.projection.weight.grad is not None
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
 
 def test_max_roi_cap_is_seeded_during_training_and_disabled_in_eval() -> None:
