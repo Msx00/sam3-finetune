@@ -190,15 +190,24 @@ svanet:
   mr_checkpoint: ""
   us_checkpoint: ""
   input_size: [512, 512]
-  # SvANet refinement runs every triggered ROI crop through a 202M-parameter
-  # encoder/decoder; one 512x512 crop costs ~5 GiB in the backward pass, so
-  # the full batch of eight exhausts the 40 GiB MIG slice and takes the driver
-  # down (surfaces as an NVML assertion in the CUDA caching allocator).  Crops
-  # are therefore refined one at a time, with at most four crops per optimizer
-  # step.  Set roi_chunk_size=0 to disable chunking, max_roi_per_step=0 for no
-  # per-step cap.
+  # SvANet is a 202M-parameter refinement network. Process crops one at a time
+  # and recompute each crop during backward so saved activations do not grow
+  # with the number of refined slices. During training, uniformly sample one
+  # qualified ROI per step as an unbiased estimator of the mean refinement
+  # loss. Inference ignores max_roi_per_step and refines every qualified ROI in
+  # chunks. Set max_roi_per_step=0 only when the available memory is verified.
+  # With a one-crop sub-batch, SvANet BatchNorm uses running statistics (the
+  # affine parameters still train) because its pooled 1x1 branch cannot compute
+  # training statistics from one value.
   roi_chunk_size: 1
-  max_roi_per_step: 4
+  max_roi_per_step: 1
+  activation_checkpointing: true
+  # SAM3's dataset transform maps [0,1] images to [-1,1]. Restore [0,1]
+  # before the unmodified SvANet preprocessing contract.
+  sam3_image_mean: [0.5, 0.5, 0.5]
+  sam3_image_std: [0.5, 0.5, 0.5]
+  svanet_image_mean: null
+  svanet_image_std: null
   roi_expand_ratio: 0.25
   min_roi_size: 32
   mask_threshold: 0.5
@@ -260,7 +269,10 @@ training:
   learning_rate: 0.00001
   weight_decay: 0.0001
   data_dir: ""
-  amp: false
+  # A800 supports BF16 natively. This approximately halves activation memory
+  # without FP16 loss scaling; unsupported GPUs fall back to scaled FP16.
+  amp: true
+  amp_dtype: bfloat16
   save_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/train_from_scratch
   # Direct Stage 5 must not resume a Stage 4 checkpoint.
   resume: null

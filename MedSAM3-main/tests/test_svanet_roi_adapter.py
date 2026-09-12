@@ -21,6 +21,36 @@ class ConstantSvANet(nn.Module):
         return torch.cat((background, foreground), dim=1)
 
 
+class BatchNormSvANet(nn.Module):
+    """Small network that exposes singleton-BN and checkpoint recomputation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(3, 2, kernel_size=1)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.batch_norm = nn.BatchNorm2d(2)
+        self.call_count = 0
+        self.batch_norm_training_states = []
+        self.batch_norm_tracking_states = []
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        self.call_count += 1
+        self.batch_norm_training_states.append(self.batch_norm.training)
+        self.batch_norm_tracking_states.append(self.batch_norm.track_running_stats)
+        features = self.batch_norm(self.pool(self.projection(images)))
+        return features.expand(-1, -1, images.shape[-2], images.shape[-1])
+
+
+class RecordingSvANet(ConstantSvANet):
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_input = None
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        self.last_input = images.detach().clone()
+        return super().forward(images)
+
+
 def _small_area_logits(batch: int = 1) -> torch.Tensor:
     return torch.tensor([[5.0, -2.0, -3.0]]).expand(batch, -1).clone()
 
@@ -230,16 +260,195 @@ def test_roi_chunking_matches_single_forward_for_values_and_gradients() -> None:
     assert torch.equal(chunked_grad, reference_grad)
 
 
-def test_max_roi_per_step_caps_and_reports_skipped_crops() -> None:
-    model = ConstantSvANet()
-    adapter = _adapter(model, max_roi_per_step=1)
-    images = torch.randn(3, 3, 8, 8)
-    sam3 = torch.full((3, 8, 8), -10.0)
+def test_activation_checkpoint_backward_restores_singleton_batch_norm_state() -> None:
+    model = BatchNormSvANet()
+    adapter = _adapter(
+        model,
+        roi_chunk_size=1,
+        activation_checkpointing=True,
+    )
+    adapter.train()
+    images = torch.randn(1, 3, 8, 8)
+    sam3 = torch.full((1, 8, 8), -10.0)
+    gt = torch.zeros(1, 8, 8)
+    gt[:, 2:6, 3:7] = 1.0
+
+    output = adapter(
+        images,
+        sam3,
+        _small_area_logits(),
+        area_labels=torch.zeros(1, dtype=torch.long),
+        teacher_area_mask=torch.ones(1, dtype=torch.bool),
+        gt_masks=gt,
+        use_gt_roi=True,
+    )
+
+    # The original checkpointed forward has completed and must restore the
+    # adapter's training state before autograd starts its recomputation.
+    assert model.batch_norm.training
+    output["refine_loss"].backward()
+
+    # One call is the original forward and one is checkpoint recomputation.
+    # Both must use running statistics because BxHxW is 1x1x1, while the
+    # module must return to training mode after each temporary context.
+    assert model.call_count == 2
+    assert model.batch_norm_training_states == [False, False]
+    assert model.batch_norm.training
+    assert model.projection.weight.grad is not None
+    assert torch.isfinite(model.projection.weight.grad).all()
+
+
+def test_checkpoint_recompute_does_not_update_batch_norm_running_stats_twice() -> None:
+    model = BatchNormSvANet()
+    adapter = _adapter(
+        model,
+        roi_chunk_size=2,
+        activation_checkpointing=True,
+    )
+    adapter.train()
+    images = torch.randn(2, 3, 8, 8)
+    sam3 = torch.full((2, 8, 8), -10.0)
+    gt = torch.zeros(2, 8, 8)
+    gt[:, 2:6, 3:7] = 1.0
+
+    output = adapter(
+        images,
+        sam3,
+        _small_area_logits(2),
+        area_labels=torch.zeros(2, dtype=torch.long),
+        teacher_area_mask=torch.ones(2, dtype=torch.bool),
+        gt_masks=gt,
+        use_gt_roi=True,
+    )
+    assert model.batch_norm.num_batches_tracked.item() == 1
+
+    output["refine_loss"].backward()
+
+    assert model.call_count == 2
+    assert model.batch_norm_training_states == [True, True]
+    assert model.batch_norm_tracking_states == [True, True]
+    assert model.batch_norm.track_running_stats
+    assert model.batch_norm.num_batches_tracked.item() == 1
+
+
+def test_max_roi_cap_is_seeded_during_training_and_disabled_in_eval() -> None:
+    batch = 4
+    images = torch.randn(batch, 3, 8, 8)
+    sam3 = torch.full((batch, 8, 8), -10.0)
     sam3[:, 2:6, 3:7] = 6.0
+    gt = torch.zeros(batch, 8, 8)
+    gt[:, 2:6, 3:7] = 1.0
 
-    output = adapter(images, sam3, _small_area_logits(3))
+    model = ConstantSvANet()
+    adapter = _adapter(model, max_roi_per_step=2)
+    adapter.train()
 
-    assert model.call_count == 1
-    assert output["trigger_mask"].sum().item() == 1
+    seed = 17
+    torch.manual_seed(seed)
+    expected_order = torch.randperm(batch).tolist()
+    expected_selected = [
+        index for index in range(batch) if index in set(expected_order[:2])
+    ]
+    torch.manual_seed(seed)
+    first = adapter(
+        images,
+        sam3,
+        _small_area_logits(batch),
+        area_labels=torch.zeros(batch, dtype=torch.long),
+        teacher_area_mask=torch.ones(batch, dtype=torch.bool),
+        gt_masks=gt,
+        use_gt_roi=True,
+    )
+    torch.manual_seed(seed)
+    second = adapter(
+        images,
+        sam3,
+        _small_area_logits(batch),
+        area_labels=torch.zeros(batch, dtype=torch.long),
+        teacher_area_mask=torch.ones(batch, dtype=torch.bool),
+        gt_masks=gt,
+        use_gt_roi=True,
+    )
+
+    assert first["refined_indices"] == expected_selected
+    assert second["refined_indices"] == expected_selected
+    assert first["skipped_indices"] == [
+        index for index in range(batch) if index not in expected_selected
+    ]
+    assert first["batch_stats"]["trigger_count"] == 2
+    assert first["batch_stats"]["training_cap_skip_count"] == batch - 2
+    # Both calls above contribute to the adapter's cumulative diagnostics.
+    assert adapter.runtime_stats["training_cap_skip_count"] == 2 * (batch - 2)
+
+    adapter.eval()
+    evaluated = adapter(images, sam3, _small_area_logits(batch))
+
+    assert evaluated["refined_indices"] == list(range(batch))
+    assert evaluated["skipped_indices"] == []
+    assert evaluated["batch_stats"]["trigger_count"] == batch
+    assert evaluated["batch_stats"]["training_cap_skip_count"] == 0
+
+
+def test_training_cap_samples_only_after_roi_reliability_check() -> None:
+    model = ConstantSvANet()
+    adapter = _adapter(
+        model,
+        max_roi_per_step=1,
+        min_component_pixels=4,
+        empty_mask_fallback="locator_then_box_then_skip",
+    )
+    adapter.train()
+    images = torch.randn(2, 3, 8, 8)
+    sam3 = torch.full((2, 8, 8), -10.0)
+    sam3[0, 2, 2] = 10.0  # rejected one-pixel component
+    sam3[1, 2:6, 3:7] = 10.0
+    gt = torch.zeros(2, 8, 8)
+    gt[:, 2:6, 3:7] = 1.0
+
+    output = adapter(
+        images,
+        sam3,
+        _small_area_logits(2),
+        area_labels=torch.zeros(2, dtype=torch.long),
+        teacher_area_mask=torch.ones(2, dtype=torch.bool),
+        gt_masks=gt,
+    )
+
+    assert output["refined_indices"] == [1]
+    assert output["skipped_indices"] == [0]
     assert output["batch_stats"]["trigger_count"] == 1
-    assert len(output["skipped_indices"]) == 2
+    assert model.call_count == 1
+
+
+def test_sam3_images_are_denormalized_before_optional_svanet_normalization() -> None:
+    images = torch.empty(1, 3, 8, 8)
+    images[:, 0].fill_(-1.0)
+    images[:, 1].fill_(0.0)
+    images[:, 2].fill_(1.0)
+    sam3 = torch.full((1, 8, 8), 10.0)
+
+    raw_model = RecordingSvANet()
+    raw_adapter = _adapter(raw_model)
+    raw_adapter(images, sam3, _small_area_logits())
+
+    assert raw_model.last_input is not None
+    expected_raw = torch.tensor([0.0, 0.5, 1.0]).view(1, 3, 1, 1)
+    assert torch.allclose(
+        raw_model.last_input,
+        expected_raw.expand_as(raw_model.last_input),
+    )
+
+    normalized_model = RecordingSvANet()
+    normalized_adapter = _adapter(
+        normalized_model,
+        svanet_image_mean=[0.5, 0.5, 0.5],
+        svanet_image_std=[0.5, 0.25, 0.125],
+    )
+    normalized_adapter(images, sam3, _small_area_logits())
+
+    assert normalized_model.last_input is not None
+    expected_normalized = torch.tensor([-1.0, 0.0, 4.0]).view(1, 3, 1, 1)
+    assert torch.allclose(
+        normalized_model.last_input,
+        expected_normalized.expand_as(normalized_model.last_input),
+    )

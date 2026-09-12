@@ -8,6 +8,20 @@ from models.moe_lora import RoutedMoELinear
 from models.training_stages import STAGE_ACTIVE_LOSSES, STAGE_CHECKPOINTS, StageTrainingManager
 
 
+class DummyGradScaler:
+    def __init__(self, scale=128.0):
+        self.scale = float(scale)
+
+    def is_enabled(self):
+        return True
+
+    def state_dict(self):
+        return {"scale": self.scale}
+
+    def load_state_dict(self, state):
+        self.scale = float(state["scale"])
+
+
 class DummyLayer(nn.Module):
     def __init__(self, dim=4):
         super().__init__()
@@ -114,8 +128,10 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
         if stage == 3:
             path = tmp_path / manager.checkpoint_name
             scheduler = StepLR(optimizer, step_size=1)
+            grad_scaler = DummyGradScaler()
             manager.save_checkpoint(
                 path, optimizer, epoch=1, best_loss=0.5, scheduler=scheduler,
+                grad_scaler=grad_scaler,
                 selected_patient_ids={"mr_patient_ids": [1]},
                 area_thresholds={"small_max": 0.01},
                 boundary_thresholds={"mr": {"contrast_low": 0.2}},
@@ -132,6 +148,7 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
                 "model_state", "router_state", "expert_lora_state",
                 "shared_lora_state", "svanet_state", "optimizer_state",
                 "scheduler_state", "epoch", "stage", "best_metric",
+                "grad_scaler_state",
                 "selected_patient_ids", "area_thresholds",
                 "boundary_thresholds", "config", "next_batch_index",
                 "global_step", "rng_state", "progress_state",
@@ -144,9 +161,14 @@ def test_all_stage_freeze_policies_and_optimizer_groups(tmp_path):
             assert payload["checkpoint_kind"] == "step"
             assert payload["world_size"] == 1
             assert not path.with_suffix(path.suffix + ".tmp").exists()
-            resumed = manager.resume(path, optimizer, scheduler)
+            grad_scaler.scale = 1.0
+            resumed = manager.resume(
+                path, optimizer, scheduler, grad_scaler=grad_scaler
+            )
             assert resumed["stage"] == 3
             assert resumed["optimizer_state_restored"] is True
+            assert resumed["grad_scaler_state_restored"] is True
+            assert grad_scaler.scale == 128.0
             try:
                 manager.load_checkpoint(path, allowed_stages={2})
                 raise AssertionError("stage mismatch was not rejected")

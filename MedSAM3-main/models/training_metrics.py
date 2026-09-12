@@ -191,6 +191,7 @@ class EpochStatistics:
             "box_fallback_count", "locator_fallback_count",
             "full_image_fallback_count", "unreliable_mask_count",
             "low_area_confidence_skip_count", "no_reliable_roi_skip_count",
+            "training_cap_skip_count",
         ):
             self.svanet[name] += float(stats.get(name, 0))
         trigger_count = float(stats.get("trigger_count", 0))
@@ -331,6 +332,9 @@ class EpochStatistics:
             ),
             "no_reliable_roi_skip_count": int(
                 self.svanet["no_reliable_roi_skip_count"]
+            ),
+            "training_cap_skip_count": int(
+                self.svanet["training_cap_skip_count"]
             ),
             "mean_roi_width": self.svanet["roi_width_weighted"] / triggers if triggers else 0.0,
             "mean_roi_height": self.svanet["roi_height_weighted"] / triggers if triggers else 0.0,

@@ -37,7 +37,8 @@ DEFAULT_CC="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc"
 DEFAULT_CXX="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++"
 [[ ! -x "${DEFAULT_CC}" ]] || export CC="${CC:-${DEFAULT_CC}}"
 [[ ! -x "${DEFAULT_CXX}" ]] || export CXX="${CXX:-${DEFAULT_CXX}}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Inherit an explicitly selected allocator; otherwise use PyTorch's native
+# backend, consistent with the main training launcher.
 
 read -r -a DEVICE_ARGS <<< "${DEVICE_SETS}"
 [[ ${#DEVICE_ARGS[@]} -gt 0 ]] || { echo "DEVICE_SETS must not be empty"; exit 1; }
@@ -78,6 +79,7 @@ echo "Suite: ${SUITE}"
 echo "Device sets: ${DEVICE_SETS}"
 echo "Seeds: ${SEEDS:-study defaults}"
 echo "Dry run: ${DRY_RUN}"
+echo "CUDA allocator: ${PYTORCH_CUDA_ALLOC_CONF:-native (PyTorch default)}"
 
 "${VALIDATE_ARGS[@]}"
 "${RUN_ARGS[@]}"

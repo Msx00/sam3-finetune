@@ -36,7 +36,9 @@ DEFAULT_CC="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc"
 DEFAULT_CXX="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++"
 [[ ! -x "${DEFAULT_CC}" ]] || export CC="${CC:-${DEFAULT_CC}}"
 [[ ! -x "${DEFAULT_CXX}" ]] || export CXX="${CXX:-${DEFAULT_CXX}}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Keep PyTorch's native allocator unless the server administrator/user selects
+# another backend. Forcing expandable_segments can be fragile in MIG/container
+# environments and is not a substitute for lowering live activation memory.
 
 read -r -a DEVICE_ARGS <<< "${GPU_IDS}"
 if [[ ${#DEVICE_ARGS[@]} -eq 0 ]]; then
@@ -64,5 +66,6 @@ echo "Config: ${CONFIG}"
 echo "GPU IDs: ${GPU_IDS}"
 echo "Stage: ${STAGE:-<from config>}"
 echo "Resume: ${RESUME:-disabled}"
+echo "CUDA allocator: ${PYTORCH_CUDA_ALLOC_CONF:-native (PyTorch default)}"
 echo "Log: ${LOG_FILE}"
 "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"

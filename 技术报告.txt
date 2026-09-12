@@ -1,8 +1,8 @@
 HMoE-SAM3 方法改造与消融实验技术报告
 ====================================
 
-生成日期：2026-09-10
-工程目录：/home/data/mashixing/Project/SAM3-ICRA/mysam_now_optimize/mysam
+更新日期：2026-09-13
+工程目录：/home/data/mashixing/Project/SAM3-ICRA/mysam_now_optimize/sam3-finetune
 
 
 一、任务目标与结论
@@ -164,9 +164,9 @@ resize 到 1008×1008，并按训练相同的 mean/std=0.5 归一化。构造的
 五、代码结构与启动入口
 ----------------------
 
-mysam 顶层目前仅保留两个 shell 启动入口：
+sam3-finetune 顶层目前仅保留两个 shell 启动入口：
 
-  train.sh   唯一真实训练入口，默认 Stage 5 direct、GPU 0/1，可用 CONFIG/GPU_IDS/RESUME 覆盖。
+  train.sh   唯一真实训练入口，默认 Stage 5 联合训练、GPU 0，可用 CONFIG/GPU_IDS/RESUME 覆盖。
   test.sh    唯一正式测试入口，同时评估 none/text/coarse_box/box/text_box。
 
 服务器执行：
@@ -176,7 +176,7 @@ mysam 顶层目前仅保留两个 shell 启动入口：
   bash ablation/run.sh
 
 删除了顶层 1.sh、2.sh、debug*.sh、run.sh 等重复入口。MedSAM3-main 与 SvANet-main 内部的上游、
-工具或第三方 shell 文件被保留，因为它们属于子工程资产，不是 mysam 顶层启动入口。
+工具或第三方 shell 文件被保留，因为它们属于子工程资产，不是仓库顶层启动入口。
 
 关键实现文件：
 
@@ -186,12 +186,12 @@ mysam 顶层目前仅保留两个 shell 启动入口：
 - MedSAM3-main/models/moe_losses.py：Hungarian 对齐的 locator/aux/boundary/router 损失。
 - MedSAM3-main/models/runtime_config.py：训练/测试/推理统一解析 MoE 配置。
 - MedSAM3-main/data/patient_dataset.py：可复现 prompt curriculum 和粗框生成。
-- MedSAM3-main/models/svanet_roi_adapter.py：可靠 ROI 选择、安全回退和融合。
-- MedSAM3-main/train_sam3_lora_native.py：训练集成、seed、日志、统计与阶段管理。
+- MedSAM3-main/models/svanet_roi_adapter.py：可靠 ROI 选择、安全回退和融合，以及逐 ROI activation checkpoint。
+- MedSAM3-main/train_sam3_lora_native.py：训练集成、BF16/FP16 AMP、显存诊断、seed、日志、统计与阶段管理。
 - MedSAM3-main/test_moe_sam3_prompts.py：严格去除 GT target 的多提示协议测试。
 - MedSAM3-main/infer_moe_sam3.py：真正只读 raw slice 的部署入口。
 - MedSAM3-main/tests/test_moe_ddp.py：shared fallback 下的双卡图可达性回归。
-- MedSAM3-main/configs/moe_sam3_stage5_direct.yaml：唯一 train.sh 默认主配置。
+- MedSAM3-main/configs/moe_sam3_train_from_scratch.yaml：唯一 train.sh 默认主配置。
 
 三个启动脚本从自身位置解析代码目录，支持仓库部署到不同服务器目录；用户已有的 /mnt/afs 数据、
 COCO JSON、threshold、SAM3/SvANet checkpoint 路径没有被替换。
@@ -201,7 +201,7 @@ COCO JSON、threshold、SAM3/SvANet checkpoint 路径没有被替换。
 六、科学消融实验
 ----------------
 
-实现目录：mysam/ablation/
+实现目录：sam3-finetune/ablation/
 
   run.sh                   远端消融启动入口，复用训练环境并支持单卡/多卡实验队列
   study.yaml                参照方法、单因素变体、suite 与 seed
@@ -227,7 +227,7 @@ COCO JSON、threshold、SAM3/SvANet checkpoint 路径没有被替换。
 路由源选择，不应作为最终部署方法。permanent teacher 仍在验证时使用预测 route，不是 oracle
 推理上界。
 
-常用命令（在 mysam 下）：
+常用命令（在 sam3-finetune 仓库根目录下）：
 
   python ablation/run_ablation.py validate --suite all
   python ablation/run_ablation.py list --suite primary
@@ -269,11 +269,11 @@ paired sign-flip randomization p value，并在每个指标族内做 Holm 校正
 
 本地 CPU 验证：
 
-- MedSAM3-main/tests：52 passed；其中包含 CPU Gloo、DDP(find_unused_parameters=True)、整批
+- MedSAM3-main/tests：58 passed；其中包含 CPU Gloo、DDP(find_unused_parameters=True)、整批
   shared fallback 和 post-forward router loss 的专项回归。
 - ablation/test_ablation.py：12 passed。
 - 全消融矩阵 validate：93/93 cell 的数据和 checkpoint 路径保持不变。
-- train.sh、test.sh、ablation/run.sh 通过 bash -n；mysam 顶层 shell 文件数仍为 2。
+- train.sh、test.sh、ablation/run.sh 通过 bash -n；sam3-finetune 顶层 shell 文件数仍为 2。
 - Python 文件通过 py_compile，YAML 可解析，git diff --check 无空白错误。
 
 未执行完整 GPU 训练或真实测试集推理：本地机器没有远端 /mnt/afs 数据与正式 checkpoint，完整

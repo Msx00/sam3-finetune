@@ -19,6 +19,7 @@ import torch
 from scipy import ndimage
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .moe_losses import dice_bce_with_logits
 
@@ -322,6 +323,11 @@ class SvANetROIAdapter(nn.Module):
         confidence_gate_during_training: bool = False,
         roi_chunk_size: int = 0,
         max_roi_per_step: int = 0,
+        activation_checkpointing: bool = False,
+        sam3_image_mean: Sequence[float] = (0.5, 0.5, 0.5),
+        sam3_image_std: Sequence[float] = (0.5, 0.5, 0.5),
+        svanet_image_mean: Optional[Sequence[float]] = None,
+        svanet_image_std: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         if empty_mask_fallback not in self._FALLBACK_CHAINS:
@@ -356,6 +362,19 @@ class SvANetROIAdapter(nn.Module):
             raise ValueError("roi_chunk_size must be non-negative (0 = all crops)")
         if int(max_roi_per_step) < 0:
             raise ValueError("max_roi_per_step must be non-negative (0 = unlimited)")
+        if len(sam3_image_mean) != 3 or len(sam3_image_std) != 3:
+            raise ValueError("SAM3 image mean/std must each contain three values")
+        if any(float(value) <= 0.0 for value in sam3_image_std):
+            raise ValueError("SAM3 image std values must be positive")
+        if (svanet_image_mean is None) != (svanet_image_std is None):
+            raise ValueError(
+                "SvANet image mean and std must either both be set or both be omitted"
+            )
+        if svanet_image_mean is not None:
+            if len(svanet_image_mean) != 3 or len(svanet_image_std) != 3:
+                raise ValueError("SvANet image mean/std must each contain three values")
+            if any(float(value) <= 0.0 for value in svanet_image_std):
+                raise ValueError("SvANet image std values must be positive")
         self.svanet = svanet
         self.input_size = tuple(int(value) for value in input_size)
         self.roi_expand_ratio = float(roi_expand_ratio)
@@ -376,15 +395,42 @@ class SvANetROIAdapter(nn.Module):
         self.confidence_gate_during_training = bool(
             confidence_gate_during_training
         )
-        # SvANet refinement is the memory peak of a training step: every
-        # triggered image contributes a full-resolution crop, and running the
-        # whole batch through the 202M-parameter encoder/decoder at once can
-        # exhaust device memory (observed as an NVML assertion inside the CUDA
-        # caching allocator).  ``roi_chunk_size`` splits that forward into
-        # sub-batches so peak activation memory stays bounded, and
-        # ``max_roi_per_step`` caps how many crops are refined per step.
+        # SvANet refinement is the memory peak of a training step. Chunking
+        # bounds temporary workspace, while activation checkpointing prevents
+        # every chunk's saved tensors from remaining live until the common
+        # backward pass. ``max_roi_per_step`` is a training-time stochastic
+        # supervision cap; inference always refines every qualified ROI.
         self.roi_chunk_size = int(roi_chunk_size)
         self.max_roi_per_step = int(max_roi_per_step)
+        self.activation_checkpointing = bool(activation_checkpointing)
+        self.register_buffer(
+            "sam3_image_mean",
+            torch.tensor(sam3_image_mean, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sam3_image_std",
+            torch.tensor(sam3_image_std, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "svanet_image_mean",
+            (
+                torch.tensor(svanet_image_mean, dtype=torch.float32).view(1, 3, 1, 1)
+                if svanet_image_mean is not None
+                else torch.empty(0, dtype=torch.float32)
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "svanet_image_std",
+            (
+                torch.tensor(svanet_image_std, dtype=torch.float32).view(1, 3, 1, 1)
+                if svanet_image_std is not None
+                else torch.empty(0, dtype=torch.float32)
+            ),
+            persistent=False,
+        )
         self.reset_runtime_stats()
 
     def reset_runtime_stats(self) -> None:
@@ -397,6 +443,7 @@ class SvANetROIAdapter(nn.Module):
             "unreliable_mask_count": 0,
             "low_area_confidence_skip_count": 0,
             "no_reliable_roi_skip_count": 0,
+            "training_cap_skip_count": 0,
         }
 
     def _zero_refine_loss(self, images: torch.Tensor) -> torch.Tensor:
@@ -446,30 +493,114 @@ class SvANetROIAdapter(nn.Module):
             for module in batch_norms:
                 module.train()
 
+    @contextlib.contextmanager
+    def _batch_norm_recompute(self) -> Iterator[None]:
+        """Preserve BatchNorm buffers across checkpoint recomputation.
+
+        Checkpoint recomputation is an autograd implementation detail, not a
+        second training observation. The recompute must execute the identical
+        BatchNorm graph (including running-stat tracking) so non-reentrant
+        checkpoint metadata matches. Snapshotting and restoring the small
+        buffers prevents the recompute from counting as a second observation.
+        """
+        batch_norms = [
+            module for module in self.svanet.modules()
+            if isinstance(module, nn.modules.batchnorm._BatchNorm)
+            and module.training
+            and module.track_running_stats
+        ]
+        snapshots = [
+            (
+                module,
+                module.running_mean.detach().clone(),
+                module.running_var.detach().clone(),
+                module.num_batches_tracked.detach().clone(),
+            )
+            for module in batch_norms
+        ]
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for module, running_mean, running_var, num_batches in snapshots:
+                    module.running_mean.copy_(running_mean)
+                    module.running_var.copy_(running_var)
+                    module.num_batches_tracked.copy_(num_batches)
+
     def _svanet_forward(self, model_input: torch.Tensor) -> Any:
         """Forward ROI crops through SvANet with the memory/batch guards applied."""
         return self._run_svanet(model_input)
 
-    def _run_svanet(self, model_input: torch.Tensor) -> Any:
-        """Run SvANet with bounded memory; math is identical to one big call.
+    def _prepare_svanet_image(self, crop: torch.Tensor) -> torch.Tensor:
+        """Convert a SAM3-normalized crop to SvANet's declared input domain.
 
-        Splitting the batch into sub-batches keeps the graph connected, so
-        gradients still accumulate across chunks exactly as in a single
-        forward. Chunks are only used while gradients are tracked; inference
-        keeps the original single-call path. Sub-batches of one crop run with
-        BatchNorm in eval mode (see :meth:`_singleton_batch_norms`).
+        The training datasets normalize SAM3 inputs with mean/std 0.5. SvANet's
+        original pipeline receives ``ToTensor`` images in [0, 1] unless dataset
+        statistics are explicitly supplied. Feeding the [-1, 1] SAM3 tensor
+        directly to its ResNet backbone silently violates that contract.
+        """
+        crop = crop.float()
+        crop = crop * self.sam3_image_std.to(crop) + self.sam3_image_mean.to(crop)
+        crop = crop.clamp_(0.0, 1.0)
+        if self.svanet_image_mean.numel():
+            crop = (
+                crop - self.svanet_image_mean.to(crop)
+            ) / self.svanet_image_std.to(crop)
+        return crop
+
+    def _run_svanet(self, model_input: torch.Tensor) -> Any:
+        """Run SvANet in chunks and optionally checkpoint their activations.
+
+        A plain list of chunk outputs still retains every chunk's autograd
+        saved tensors until the caller invokes backward. Non-reentrant
+        checkpointing stores only the chunk inputs and recomputes SvANet during
+        backward, which makes the saved-activation peak approximately one
+        chunk instead of the sum of all chunks. The BatchNorm mode used by a
+        singleton forward is repeated during checkpoint recomputation.
         """
         chunk_size = self.roi_chunk_size
         batch = model_input.shape[0]
-        if chunk_size <= 0 or chunk_size >= batch or not torch.is_grad_enabled():
+        if chunk_size <= 0 or chunk_size >= batch:
             chunks = [model_input]
         else:
             chunks = [
                 model_input[start : start + chunk_size]
                 for start in range(0, batch, chunk_size)
             ]
-        with self._singleton_batch_norms([chunk.shape[0] for chunk in chunks]):
-            outputs = [self.svanet(chunk) for chunk in chunks]
+        chunk_sizes = [chunk.shape[0] for chunk in chunks]
+        singleton_bn_mode = 1 in chunk_sizes and self.svanet.training
+        checkpoint_enabled = (
+            self.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and any(parameter.requires_grad for parameter in self.svanet.parameters())
+        )
+
+        def run_chunk(chunk: torch.Tensor) -> Any:
+            if not checkpoint_enabled:
+                return self.svanet(chunk)
+
+            # The outer context below controls the original forward. During
+            # backward it has already exited, so explicitly recreate the same
+            # BatchNorm mode for the non-reentrant recomputation.
+            def checkpoint_contexts():
+                recompute_context = (
+                    self._singleton_batch_norms((1,))
+                    if singleton_bn_mode
+                    else self._batch_norm_recompute()
+                )
+                return contextlib.nullcontext(), recompute_context
+
+            return activation_checkpoint(
+                self.svanet,
+                chunk,
+                use_reentrant=False,
+                preserve_rng_state=True,
+                context_fn=checkpoint_contexts,
+            )
+
+        with self._singleton_batch_norms(chunk_sizes):
+            outputs = [run_chunk(chunk) for chunk in chunks]
         if len(outputs) == 1:
             return outputs[0]
         if all(isinstance(output, torch.Tensor) for output in outputs):
@@ -540,6 +671,13 @@ class SvANetROIAdapter(nn.Module):
             )
         if sam3_logits.shape[0] != batch or area_logits.shape[0] != batch:
             raise ValueError("Image, SAM3 logits and area logits batch sizes must match")
+
+        # ROI proposal and pasted masks are control/metric paths. The only
+        # SvANet training objective is ``refine_loss`` below, and the input
+        # image does not require gradients. Detaching here avoids retaining a
+        # second full-resolution path back into the already-live SAM3 graph.
+        sam3_logits = sam3_logits.detach()
+        area_logits = area_logits.detach()
         for name, values in (
             ("area_labels", area_labels),
             ("teacher_area_mask", teacher_area_mask),
@@ -568,6 +706,7 @@ class SvANetROIAdapter(nn.Module):
                 raise ValueError(
                     "locator_logits must be [B,H,W] or [B,1,H,W]"
                 )
+            locator_logits = locator_logits.detach()
             if locator_logits.shape[-2:] != (height, width):
                 locator_logits = F.interpolate(
                     locator_logits[:, None].float(),
@@ -594,14 +733,7 @@ class SvANetROIAdapter(nn.Module):
             low_area_confidence.sum().item()
         )
         trigger_indices = trigger.nonzero(as_tuple=False).flatten().tolist()
-        # Bound the number of SvANet crops per step. Crops beyond the cap are
-        # reported as skipped so callers can still index the refined list.
-        trigger_cap = self.max_roi_per_step
-        if trigger_cap > 0 and len(trigger_indices) > trigger_cap:
-            dropped_indices = trigger_indices[trigger_cap:]
-            trigger_indices = trigger_indices[:trigger_cap]
-        else:
-            dropped_indices = []
+        trigger_cap = self.max_roi_per_step if self.training else 0
         prompts = box_prompts or [None] * batch
         prompt_sizes = box_prompt_sizes or [None] * batch
         if len(prompts) != batch:
@@ -622,7 +754,6 @@ class SvANetROIAdapter(nn.Module):
         skipped_indices: List[int] = low_area_confidence.nonzero(
             as_tuple=False
         ).flatten().tolist()
-        skipped_indices.extend(dropped_indices)
         proposal_diagnostics: List[Dict[str, Any]] = []
         batch_empty_mask_count = 0
         batch_unreliable_mask_count = 0
@@ -678,7 +809,6 @@ class SvANetROIAdapter(nn.Module):
                         if candidate is not None:
                             box, source = candidate, "locator_fallback"
                             confidence = float(locator_stats["confidence"])
-                            self.runtime_stats["locator_fallback_count"] += 1
                             break
                     elif fallback == "box":
                         prompt = self._prompt_box(
@@ -687,12 +817,10 @@ class SvANetROIAdapter(nn.Module):
                         if prompt is not None:
                             box, source = tuple(prompt), "box_fallback"
                             confidence = 1.0
-                            self.runtime_stats["box_fallback_count"] += 1
                             break
                     elif fallback == "full_image":
                         box, source = (0, 0, width, height), "full_image_fallback"
                         confidence = 0.0
-                        self.runtime_stats["full_image_fallback_count"] += 1
                         break
                     elif fallback == "skip":
                         source = "no_reliable_roi_skip"
@@ -715,7 +843,10 @@ class SvANetROIAdapter(nn.Module):
             elif crop.shape[1] != 3:
                 crop = crop[:, :3]
             crop = F.interpolate(
-                crop.float(), self.input_size, mode="bilinear", align_corners=False
+                self._prepare_svanet_image(crop),
+                self.input_size,
+                mode="bilinear",
+                align_corners=False,
             )[0]
             rois.append(roi)
             roi_images.append(crop)
@@ -727,6 +858,48 @@ class SvANetROIAdapter(nn.Module):
             if gt_masks is not None:
                 target = gt_masks[index : index + 1, None, y1:y2, x1:x2].float()
                 roi_targets.append(F.interpolate(target, self.input_size, mode="nearest")[0, 0])
+
+        # Apply the compute cap only after ROI reliability is known. Sampling
+        # from valid candidates avoids a zero-refinement step when the first
+        # randomly chosen area trigger has no usable SAM3/locator/box ROI.
+        dropped_indices: List[int] = []
+        if trigger_cap > 0 and len(refine_indices) > trigger_cap:
+            order = torch.randperm(
+                len(refine_indices), device=area_logits.device
+            ).cpu().tolist()
+            selected_positions = set(order[:trigger_cap])
+            dropped_positions = [
+                position for position in range(len(refine_indices))
+                if position not in selected_positions
+            ]
+            dropped_indices = [refine_indices[position] for position in dropped_positions]
+            skipped_indices.extend(dropped_indices)
+            for diagnostic in proposal_diagnostics:
+                if diagnostic.get("image_index") in dropped_indices:
+                    diagnostic["roi_candidate"] = diagnostic.get("decision")
+                    diagnostic["decision"] = "training_cap_skip"
+
+            keep = [
+                position for position in range(len(refine_indices))
+                if position in selected_positions
+            ]
+            refine_indices = [refine_indices[position] for position in keep]
+            rois = [rois[position] for position in keep]
+            roi_images = [roi_images[position] for position in keep]
+            sources = [sources[position] for position in keep]
+            source_confidences = [source_confidences[position] for position in keep]
+            if roi_targets:
+                roi_targets = [roi_targets[position] for position in keep]
+
+        skipped_indices.sort()
+        self.runtime_stats["training_cap_skip_count"] += len(dropped_indices)
+        self.runtime_stats["box_fallback_count"] += sources.count("box_fallback")
+        self.runtime_stats["locator_fallback_count"] += sources.count(
+            "locator_fallback"
+        )
+        self.runtime_stats["full_image_fallback_count"] += sources.count(
+            "full_image_fallback"
+        )
 
         final_logits = sam3_logits.clone()
         roi_logits_list: List[torch.Tensor] = []
@@ -873,6 +1046,7 @@ class SvANetROIAdapter(nn.Module):
                     diagnostic.get("decision") == "skip"
                     for diagnostic in proposal_diagnostics
                 ),
+                "training_cap_skip_count": len(dropped_indices),
                 "mean_roi_width": float(np.mean(widths)) if widths else 0.0,
                 "mean_roi_height": float(np.mean(heights)) if heights else 0.0,
             },

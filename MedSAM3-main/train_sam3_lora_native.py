@@ -51,7 +51,7 @@ from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
-from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
+from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights
 from models.resumable_batch_sampler import (
     ResumableDistributedBatchSampler,
     ResumableRandomBatchSampler,
@@ -111,6 +111,27 @@ def print_rank0(*args, **kwargs):
     """Print only on rank 0."""
     if is_main_process():
         print(*args, **kwargs)
+
+
+def count_unique_parameters(*modules):
+    """Count parameters across independent modules without double counting."""
+    unique = {}
+    for module in modules:
+        if module is None:
+            continue
+        for parameter in module.parameters():
+            unique.setdefault(id(parameter), parameter)
+    total = sum(parameter.numel() for parameter in unique.values())
+    trainable = sum(
+        parameter.numel()
+        for parameter in unique.values()
+        if parameter.requires_grad
+    )
+    return {
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "trainable_percentage": 100.0 * trainable / max(total, 1),
+    }
 
 
 def set_global_seed(
@@ -868,6 +889,42 @@ class SAM3TrainerNative:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         training_config = self.config.get("training", {}) or {}
+        amp_requested = bool(training_config.get("amp", False))
+        amp_dtype_name = str(
+            training_config.get("amp_dtype", "bfloat16")
+        ).strip().lower()
+        amp_dtypes = {
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+        }
+        if amp_dtype_name not in amp_dtypes:
+            raise ValueError(
+                "training.amp_dtype must be one of: bfloat16, bf16, float16, fp16"
+            )
+        self.amp_enabled = amp_requested and self.device.type == "cuda"
+        self.amp_dtype = amp_dtypes[amp_dtype_name]
+        if (
+            self.amp_enabled
+            and self.amp_dtype is torch.bfloat16
+            and not torch.cuda.is_bf16_supported()
+        ):
+            print_rank0(
+                "WARNING: bfloat16 AMP is unavailable on this GPU; falling back "
+                "to float16 with GradScaler"
+            )
+            self.amp_dtype = torch.float16
+        scaler_enabled = self.amp_enabled and self.amp_dtype is torch.float16
+        try:
+            self.grad_scaler = torch.amp.GradScaler(
+                "cuda", enabled=scaler_enabled
+            )
+        except (AttributeError, TypeError):
+            # Compatibility with PyTorch releases predating torch.amp.GradScaler.
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+        if amp_requested and not self.amp_enabled:
+            print_rank0("WARNING: AMP was requested but CUDA is unavailable; using float32")
         self.seed = int(
             training_config.get(
                 "seed", training_config.get("data_order_seed", 42)
@@ -887,6 +944,19 @@ class SAM3TrainerNative:
             f"seed={self.seed}, "
             f"deterministic={bool(training_config.get('deterministic', False))}, "
             f"cudnn_benchmark={torch.backends.cudnn.benchmark}"
+        )
+        print_rank0(
+            "Precision: "
+            + (
+                f"AMP {str(self.amp_dtype).removeprefix('torch.')}"
+                if self.amp_enabled
+                else "float32"
+            )
+            + f", GradScaler={self.grad_scaler.is_enabled()}"
+        )
+        print_rank0(
+            "CUDA allocator: "
+            f"{os.environ.get('PYTORCH_CUDA_ALLOC_CONF', 'native (PyTorch default)')}"
         )
 
         # Build Model
@@ -1051,10 +1121,18 @@ class SAM3TrainerNative:
                     max_roi_per_step=int(
                         self.svanet_config.get("max_roi_per_step", 0)
                     ),
+                    activation_checkpointing=bool(
+                        self.svanet_config.get("activation_checkpointing", False)
+                    ),
+                    sam3_image_mean=self.svanet_config.get(
+                        "sam3_image_mean", [0.5, 0.5, 0.5]
+                    ),
+                    sam3_image_std=self.svanet_config.get(
+                        "sam3_image_std", [0.5, 0.5, 0.5]
+                    ),
+                    svanet_image_mean=self.svanet_config.get("svanet_image_mean"),
+                    svanet_image_std=self.svanet_config.get("svanet_image_std"),
                 ).to(self.device)
-
-        stats = count_parameters(self.model)
-        print_rank0(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
 
         self.model.to(self.device)
 
@@ -1089,6 +1167,13 @@ class SAM3TrainerNative:
             self.moe_loss.weights = self.stage_manager.active_loss_weights(
                 self.moe_loss.weights
             )
+
+        stats = count_unique_parameters(self.model, self.svanet_adapter)
+        print_rank0(
+            "Trainable parameters after stage policy: "
+            f"{stats['trainable_parameters']:,} / {stats['total_parameters']:,} "
+            f"({stats['trainable_percentage']:.2f}%)"
+        )
 
         # Wrap model with DDP if multi-GPU
         if self.multi_gpu and any(p.requires_grad for p in self.model.parameters()):
@@ -1133,6 +1218,7 @@ class SAM3TrainerNative:
                 lr=float(self.config["training"]["learning_rate"]),
                 weight_decay=self.config["training"]["weight_decay"]
             )
+        print_rank0(self._cuda_memory_report("model and optimizer initialized"))
 
         self.scheduler = None
         scheduler_config = self.config.get("training", {}).get("scheduler", {}) or {}
@@ -1171,6 +1257,7 @@ class SAM3TrainerNative:
                 restore_optimizer=bool(
                     self.config.get("training", {}).get("resume_optimizer", True)
                 ),
+                grad_scaler=self.grad_scaler,
             )
             self.start_epoch = int(resumed.get("epoch", 0))
             self.resume_batch_index = int(resumed.get("next_batch_index", 0))
@@ -1291,6 +1378,46 @@ class SAM3TrainerNative:
         if self.wandb_logger is not None:
             self.wandb_logger.finish()
 
+    def _autocast_context(self):
+        if not self.amp_enabled:
+            return contextlib.nullcontext()
+        return torch.autocast(
+            device_type="cuda", dtype=self.amp_dtype, enabled=True
+        )
+
+    def _cuda_memory_report(self, phase):
+        """Return allocator-only telemetry without querying NVML."""
+        if self.device.type != "cuda":
+            return f"CUDA memory [{phase}]: unavailable (CPU execution)"
+        mib = 1024 ** 2
+        try:
+            free, total = torch.cuda.mem_get_info(self.device)
+            return (
+                f"CUDA memory [{phase}]: "
+                f"allocated={torch.cuda.memory_allocated(self.device) / mib:.0f} MiB, "
+                f"reserved={torch.cuda.memory_reserved(self.device) / mib:.0f} MiB, "
+                f"peak_allocated={torch.cuda.max_memory_allocated(self.device) / mib:.0f} MiB, "
+                f"free={free / mib:.0f} MiB, total={total / mib:.0f} MiB"
+            )
+        except RuntimeError as error:
+            return f"CUDA memory [{phase}]: telemetry failed: {error}"
+
+    @staticmethod
+    def _is_cuda_allocation_failure(error):
+        message = str(error).lower()
+        return "out of memory" in message or "nvml_success == r" in message
+
+    def _raise_cuda_allocation_failure(self, error, phase, batch_index):
+        raise RuntimeError(
+            "CUDA allocation failed during "
+            f"{phase} at batch {batch_index}. On NVIDIA MIG/container setups, "
+            "PyTorch can surface an NVML_SUCCESS allocator assertion instead "
+            "of the underlying CUDA out-of-memory condition. "
+            f"{self._cuda_memory_report(phase)}. "
+            "Keep BF16 AMP and SvANet activation checkpointing enabled; if "
+            "necessary, lower training.batch_size or svanet.max_roi_per_step."
+        ) from error
+
     def _add_moe_aux_loss(
         self, total_loss, outputs_list=None, find_targets=None,
         input_batch=None, metadata=None, epoch=0,
@@ -1301,9 +1428,12 @@ class SAM3TrainerNative:
             return total_loss
         if outputs_list is None or find_targets is None or self.moe_loss is None:
             # Compatibility path for external callers that only provide a scalar.
-            self.last_router_losses = self.moe_controller.routing_supervision_losses()
-            for name, loss in self.last_router_losses.items():
+            router_losses = self.moe_controller.routing_supervision_losses()
+            for name, loss in router_losses.items():
                 total_loss = total_loss + self.router_loss_weights[name] * loss
+            self.last_router_losses = {
+                name: loss.detach() for name, loss in router_losses.items()
+            }
             return total_loss
         from models.moe_losses import (
             extract_matched_locator_logits,
@@ -1395,7 +1525,13 @@ class SAM3TrainerNative:
                 total_loss = total_loss + self.moe_loss.weights.get("refine_loss", 0.0) * refine_loss
                 components["refine_loss"] = refine_loss
                 components["total_loss"] = total_loss
-                self.last_refine_output = adapter_output
+                # EpochStatistics only consumes these two entries. Keeping the
+                # complete adapter output would retain the checkpointed SvANet
+                # graph until the next batch begins.
+                self.last_refine_output = {
+                    "refine_loss": refine_loss.detach(),
+                    "batch_stats": dict(adapter_output.get("batch_stats", {})),
+                }
                 refined_logits = adapter_output["final_logits"]
             self.last_metric_payload = {
                 "base_logits": final_logits.detach(),
@@ -1403,7 +1539,10 @@ class SAM3TrainerNative:
                 "gt_masks": gt_masks.detach(),
                 "metadata": matched_metadata,
             }
-        self.last_router_losses = components
+        self.last_router_losses = {
+            name: value.detach() if torch.is_tensor(value) else value
+            for name, value in components.items()
+        }
         return total_loss
 
     def _teacher_forcing_ratio(self, epoch):
@@ -1597,6 +1736,7 @@ class SAM3TrainerNative:
             epoch=epoch,
             best_loss=loss,
             scheduler=self.scheduler,
+            grad_scaler=self.grad_scaler,
             selected_patient_ids=self._selected_patient_state(),
             area_thresholds=self._dataset_threshold_state("area_thresholds"),
             boundary_thresholds=self._dataset_threshold_state("boundary_thresholds"),
@@ -2276,6 +2416,15 @@ class SAM3TrainerNative:
                     )
                     break
 
+                # Release the previous step's gradient tensors before building
+                # the next forward graph. This materially lowers the overlap
+                # between SAM3/SvANet activations and optimizer gradients.
+                self.optimizer.zero_grad(set_to_none=True)
+                first_update_in_epoch = batch_index == resume_batch
+                if first_update_in_epoch and self.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                    print_rank0(self._cuda_memory_report("before first forward"))
+
                 input_batch = batch_dict["input"]
                 # Move to device
                 input_batch = move_to_device(input_batch, self.device)
@@ -2288,7 +2437,15 @@ class SAM3TrainerNative:
 
                 # Forward pass
                 # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
-                outputs_list = self.model(input_batch)
+                try:
+                    with self._autocast_context():
+                        outputs_list = self.model(input_batch)
+                except RuntimeError as error:
+                    if self._is_cuda_allocation_failure(error):
+                        self._raise_cuda_allocation_failure(
+                            error, "forward", batch_index
+                        )
+                    raise
                 if self.moe_controller is not None:
                     for family, (used, total) in (
                         self.moe_controller.teacher_routing_statistics().items()
@@ -2308,7 +2465,11 @@ class SAM3TrainerNative:
 
                 # Add matcher indices to outputs (required by Sam3LossWrapper)
                 # Use SAM3Output.iteration_mode to properly iterate over outputs
-                with SAM3Output.iteration_mode(
+                # Matcher uses operations such as CUDA cdist that are not
+                # implemented directly for BF16. Autocast promotes those
+                # numerically sensitive ops to FP32 while leaving predictions
+                # in their memory-efficient representation.
+                with self._autocast_context(), SAM3Output.iteration_mode(
                     outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
                 ) as outputs_iter:
                     for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
@@ -2325,14 +2486,22 @@ class SAM3TrainerNative:
 
                 # Compute loss using Sam3LossWrapper
                 # This handles num_boxes calculation and proper weighting
-                loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                try:
+                    with self._autocast_context():
+                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
-                # Extract total loss
-                total_loss = self._add_moe_aux_loss(
-                    loss_dict[CORE_LOSS_KEY], outputs_list, find_targets,
-                    input_batch=input_batch,
-                    metadata=batch_dict.get("_patient_metadata"), epoch=epoch,
-                )
+                        # Extract total loss
+                        total_loss = self._add_moe_aux_loss(
+                            loss_dict[CORE_LOSS_KEY], outputs_list, find_targets,
+                            input_batch=input_batch,
+                            metadata=batch_dict.get("_patient_metadata"), epoch=epoch,
+                        )
+                except RuntimeError as error:
+                    if self._is_cuda_allocation_failure(error):
+                        self._raise_cuda_allocation_failure(
+                            error, "loss and refinement forward", batch_index
+                        )
+                    raise
 
                 if self.moe_controller is not None:
                     batch_metadata = batch_dict.get("_patient_metadata") or []
@@ -2347,6 +2516,7 @@ class SAM3TrainerNative:
                     train_statistics.update_svanet(self.last_refine_output)
                     if self.last_metric_payload and self.last_metric_payload["metadata"]:
                         train_statistics.update_segmentation(**self.last_metric_payload)
+                    self.last_metric_payload = None
                 if not torch.isfinite(total_loss):
                     refine_loss = None
 
@@ -2372,9 +2542,27 @@ class SAM3TrainerNative:
                     )
                     continue
 
-                # Backward
-                self.optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
+                # Backward. FP16 needs scaled gradients; BF16 uses the same
+                # branch as FP32 because its exponent range does not require a
+                # GradScaler.
+                if first_update_in_epoch:
+                    print_rank0(self._cuda_memory_report("before first backward"))
+                try:
+                    if self.grad_scaler.is_enabled():
+                        self.grad_scaler.scale(total_loss).backward()
+                        # Make gradients inspectable/clippable in their true
+                        # scale before any debug checks below.
+                        self.grad_scaler.unscale_(self.optimizer)
+                    else:
+                        total_loss.backward()
+                except RuntimeError as error:
+                    if self._is_cuda_allocation_failure(error):
+                        self._raise_cuda_allocation_failure(
+                            error, "backward", batch_index
+                        )
+                    raise
+                if first_update_in_epoch:
+                    print_rank0(self._cuda_memory_report("after first backward"))
                 if debug_mode == "train_bn_eval":
                     bad_gradients = []
                     largest_grad_name = None
@@ -2405,8 +2593,32 @@ class SAM3TrainerNative:
                         f"largest_grad={largest_grad_value:.8f} "
                         f"largest_grad_name={largest_grad_name}"
                     )
-                self.optimizer.step()
-                self.global_step += 1
+                try:
+                    if self.grad_scaler.is_enabled():
+                        previous_scale = self.grad_scaler.get_scale()
+                        self.grad_scaler.step(self.optimizer)
+                        self.grad_scaler.update()
+                        optimizer_step_applied = (
+                            self.grad_scaler.get_scale() >= previous_scale
+                        )
+                    else:
+                        self.optimizer.step()
+                        optimizer_step_applied = True
+                except RuntimeError as error:
+                    if self._is_cuda_allocation_failure(error):
+                        self._raise_cuda_allocation_failure(
+                            error, "optimizer step", batch_index
+                        )
+                    raise
+                if optimizer_step_applied:
+                    self.global_step += 1
+                else:
+                    print_rank0(
+                        f"WARNING: FP16 overflow at batch {batch_index}; "
+                        "optimizer update was skipped and global_step was not advanced"
+                    )
+                if first_update_in_epoch:
+                    print_rank0(self._cuda_memory_report("after first optimizer attempt"))
                 if debug_mode == "train_bn_eval":
                     bad_parameters = [
                         name
@@ -2427,6 +2639,7 @@ class SAM3TrainerNative:
                 pbar.set_postfix({"loss": total_loss.item()})
                 should_log_wandb = (
                     self.wandb_settings.get("enabled", False)
+                    and optimizer_step_applied
                     and self.global_step % self.wandb_logger.log_interval == 0
                 )
                 epoch_batch_limit = (
@@ -2455,6 +2668,7 @@ class SAM3TrainerNative:
 
                 if (
                     checkpoint_interval_steps
+                    and optimizer_step_applied
                     and self.global_step % checkpoint_interval_steps == 0
                 ):
                     local_progress_state = {
@@ -2546,7 +2760,8 @@ class SAM3TrainerNative:
                         )
 
                         # Forward pass
-                        outputs_list = self.model(input_batch)
+                        with self._autocast_context():
+                            outputs_list = self.model(input_batch)
 
                         # Prepare targets
                         find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
@@ -2558,7 +2773,7 @@ class SAM3TrainerNative:
                                     targets[k] = v.to(self.device)
 
                         # Add matcher indices to outputs (required by Sam3LossWrapper)
-                        with SAM3Output.iteration_mode(
+                        with self._autocast_context(), SAM3Output.iteration_mode(
                             outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
                         ) as outputs_iter:
                             for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
@@ -2570,12 +2785,13 @@ class SAM3TrainerNative:
                                             aux_out["indices"] = self.matcher(aux_out, targets)
 
                         # Compute loss using Sam3LossWrapper
-                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                        total_loss = self._add_moe_aux_loss(
-                            loss_dict[CORE_LOSS_KEY], outputs_list, find_targets,
-                            input_batch=input_batch,
-                            metadata=batch_dict.get("_patient_metadata"), epoch=epoch,
-                        )
+                        with self._autocast_context():
+                            loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                            total_loss = self._add_moe_aux_loss(
+                                loss_dict[CORE_LOSS_KEY], outputs_list, find_targets,
+                                input_batch=input_batch,
+                                metadata=batch_dict.get("_patient_metadata"), epoch=epoch,
+                            )
 
                         if self.moe_controller is not None:
                             batch_metadata = batch_dict.get("_patient_metadata") or []
@@ -2590,6 +2806,7 @@ class SAM3TrainerNative:
                             val_statistics.update_svanet(self.last_refine_output)
                             if self.last_metric_payload and self.last_metric_payload["metadata"]:
                                 val_statistics.update_segmentation(**self.last_metric_payload)
+                            self.last_metric_payload = None
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})

@@ -39,7 +39,7 @@ SUITE=all INCLUDE=confidence bash ablation/run.sh
 `MASTER_PORT`、`DRY_RUN`、`RERUN_COMPLETED` 和 `FAIL_FAST`。默认 `FAIL_FAST=1`；状态文件支持
 再次执行同一命令时自动跳过已经完成的实验。
 
-以下命令均在 `mysam/` 下执行：
+以下命令均在 `sam3-finetune/` 仓库根目录下执行：
 
 ```bash
 python ablation/run_ablation.py validate --suite primary

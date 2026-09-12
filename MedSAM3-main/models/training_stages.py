@@ -282,6 +282,7 @@ class StageTrainingManager:
         progress_state: Optional[Mapping[str, object]] = None,
         checkpoint_kind: str = "epoch",
         world_size: int = 1,
+        grad_scaler: Optional[object] = None,
     ) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -294,7 +295,7 @@ class StageTrainingManager:
             if id(parameter) in shared_names
         }
         payload = {
-            "format_version": 4,
+            "format_version": 5,
             "stage": self.stage,
             "stage_name": STAGE_NAMES[self.stage],
             "epoch": int(epoch),
@@ -316,6 +317,11 @@ class StageTrainingManager:
             "optimizer_param_names": self.optimizer_parameter_names(optimizer),
             "scheduler_state": (
                 scheduler.state_dict() if scheduler is not None else None
+            ),
+            "grad_scaler_state": (
+                grad_scaler.state_dict()
+                if grad_scaler is not None and grad_scaler.is_enabled()
+                else None
             ),
             "selected_patient_ids": dict(selected_patient_ids or {}),
             "area_thresholds": dict(area_thresholds or {}),
@@ -379,6 +385,7 @@ class StageTrainingManager:
         optimizer: AdamW,
         scheduler: Optional[object] = None,
         restore_optimizer: bool = True,
+        grad_scaler: Optional[object] = None,
     ) -> Dict[str, object]:
         payload = self.load_checkpoint(path, allowed_stages={self.stage})
         optimizer_restored = False
@@ -428,8 +435,30 @@ class StageTrainingManager:
                 RuntimeWarning,
                 stacklevel=2,
             )
+        grad_scaler_state = payload.get("grad_scaler_state")
+        scaler_enabled = bool(
+            grad_scaler is not None and grad_scaler.is_enabled()
+        )
+        scaler_restored = False
+        if grad_scaler_state and scaler_enabled and optimizer_restored:
+            grad_scaler.load_state_dict(grad_scaler_state)
+            scaler_restored = True
+        elif grad_scaler_state and not scaler_enabled:
+            warnings.warn(
+                "Checkpoint contains an FP16 GradScaler state but the current "
+                "run does not use FP16 AMP; scaler state was skipped.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        elif grad_scaler_state and not optimizer_restored:
+            warnings.warn(
+                "GradScaler state was not restored because optimizer state was reset.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         payload["optimizer_state_restored"] = optimizer_restored
         payload["scheduler_state_restored"] = bool(
             scheduler is not None and scheduler_state and optimizer_restored
         )
+        payload["grad_scaler_state_restored"] = scaler_restored
         return payload

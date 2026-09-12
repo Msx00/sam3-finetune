@@ -3,7 +3,7 @@ schema_version: 1
 # Relative paths are resolved from this file. The generator emits fully resolved
 # training YAML files because train_moe_sam3.py intentionally has no inheritance
 # semantics of its own.
-base_config: ../MedSAM3-main/configs/moe_sam3_stage5_direct.yaml
+base_config: ../MedSAM3-main/configs/moe_sam3_train_from_scratch.yaml
 train_entry: ../MedSAM3-main/train_moe_sam3.py
 output_name: ablation_hmoe_v2
 

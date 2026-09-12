@@ -138,6 +138,7 @@ class ResultTests(unittest.TestCase):
                                 "unreliable_mask_count": 5,
                                 "low_area_confidence_skip_count": 2,
                                 "no_reliable_roi_skip_count": 3,
+                                "training_cap_skip_count": 1,
                                 "locator_fallback_count": 4,
                                 "box_fallback_count": 1,
                                 "full_image_fallback_count": 0,
@@ -155,7 +156,8 @@ class ResultTests(unittest.TestCase):
             self.assertEqual(metrics["epoch"], 2)
             self.assertEqual(metrics["validation.segmentation.patient_macro_dice"], 0.8)
             self.assertEqual(metrics["validation.svanet.trigger_ratio"], 0.75)
-            self.assertEqual(metrics["validation.svanet.total_skip_ratio"], 0.25)
+            self.assertEqual(metrics["validation.svanet.total_skip_ratio"], 0.30)
+            self.assertEqual(metrics["validation.svanet.training_cap_skip_ratio"], 0.05)
             self.assertEqual(metrics["validation.svanet.locator_fallback_ratio"], 4 / 15)
             self.assertEqual(metrics["validation.prompts.image_only_ratio"], 1.0)
 

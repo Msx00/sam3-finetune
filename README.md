@@ -137,7 +137,7 @@ flowchart TD
 ## 3. 目录与正式入口
 
 ```text
-mysam/
+sam3-finetune/
 ├── train.sh                         # 顶层唯一正式训练脚本
 ├── test.sh                          # 顶层唯一正式测试脚本
 ├── README.md
@@ -148,7 +148,7 @@ mysam/
 │   ├── infer_moe_sam3.py            # 纯 image slice / 兼容 split 推理
 │   ├── test_moe_sam3_prompts.py     # 多提示协议测试与指标汇总
 │   ├── configs/
-│   │   ├── moe_sam3_stage5_direct.yaml
+│   │   ├── moe_sam3_train_from_scratch.yaml
 │   │   └── test.yaml
 │   ├── data/patient_dataset.py
 │   ├── models/
@@ -268,7 +268,7 @@ area/boundary 标签缓存）可以用 `data-preprocess/run_preprocess.sh` 一�
 正式训练配置为：
 
 ```text
-MedSAM3-main/configs/moe_sam3_stage5_direct.yaml
+MedSAM3-main/configs/moe_sam3_train_from_scratch.yaml
 ```
 
 关键方法字段如下：
@@ -308,10 +308,17 @@ dataset:
     evaluation_mode: image_only
 
 svanet:
+  roi_chunk_size: 1
+  max_roi_per_step: 1
+  activation_checkpointing: true
   empty_mask_fallback: locator_then_box_then_skip
   paste_mode: blend_with_sam3
   outside_roi: sam3
   fusion_weight: 0.35
+
+training:
+  amp: true
+  amp_dtype: bfloat16
 ```
 
 `models/runtime_config.py` 统一合并 `model`、`moe` 和 `router` 中的兼容字段，训练、测试和
@@ -331,7 +338,7 @@ svanet:
 bash train.sh
 ```
 
-`train.sh` 默认使用 Stage 5、GPU 0/1 和主配置。可通过环境变量覆盖运行参数：
+`train.sh` 默认使用 Stage 5、GPU 0 和上述主配置。可通过环境变量覆盖运行参数：
 
 ```bash
 GPU_IDS="2 3" bash train.sh
@@ -363,9 +370,9 @@ SvANet backbone 初始化开始。旧 checkpoint 不含 ImageLocator 和条件�
 ```bash
 cd MedSAM3-main
 python train_moe_sam3.py \
-  --config configs/moe_sam3_stage5_direct.yaml \
+  --config configs/moe_sam3_train_from_scratch.yaml \
   --stage 5 \
-  --device 0 1
+  --device 0
 ```
 
 多 GPU 会由入口自动使用 `torch.distributed.run` 启动。CPU Gloo 回归测试覆盖了
@@ -374,8 +381,8 @@ python train_moe_sam3.py \
 ### 7.3 Resume 与 checkpoint
 
 完整 stage checkpoint 保存 model、controller/router、专家与共享 LoRA、可选 SvANet、optimizer、
-scheduler、稳定参数名布局、DDP world size、RNG、patient IDs、阈值、epoch、batch progress 和
-best metric。
+scheduler、FP16 GradScaler、稳定参数名布局、DDP world size、RNG、patient IDs、阈值、epoch、
+batch progress 和 best metric。
 
 `training.checkpoint_interval_steps=500` 时会原子更新 `stage5_step_last.pt`。精确的
 mid-epoch 恢复要求：
@@ -384,7 +391,25 @@ mid-epoch 恢复要求：
 - 保持数据集、per-device batch size 与 `data_order_seed` 不变；
 - `num_workers=0`，以便随机增强可以精确重放。
 
-### 7.4 Loss
+### 7.4 显存安全默认值
+
+主配置针对 A800 MIG 40 GiB 环境启用 BF16 AMP。SvANet ROI 以 `roi_chunk_size=1` 执行，并用
+non-reentrant activation checkpoint 在反向时逐 crop 重算；训练期从满足条件的 ROI 中均匀抽取
+一个计算细化损失，避免同一 optimizer step 保留多份 202M 参数细化网络的激活图。该 cap 只影响
+训练监督：eval/inference 会处理全部满足条件的 ROI，并仍按 chunk 控制瞬时显存。
+单 crop 路径将 SvANet BatchNorm 作为 Frozen-BN 使用预训练 running statistics，同时保留 affine
+参数训练；这是 ASPP `1×1` 分支在 batch size 1 下的显式策略。显存允许时可在验证后将
+`max_roi_per_step` 与 `roi_chunk_size` 同时设为 2，使有效双 crop batch 更新 BN statistics。
+
+SAM3 输入在进入原始 SvANet 前会从 `[-1,1]` 反归一化到 `[0,1]`。若未来 SvANet checkpoint
+要求额外标准化，可配置 `svanet_image_mean/std`。
+
+若日志在 `backward()` 显示 `NVML_SUCCESS == r`，先查看程序输出的
+`allocated/reserved/peak/free/total` 显存记录。仍不足时优先减小 `training.batch_size`；不要通过修改
+数据或 checkpoint 路径规避该问题。启动脚本不再强制 `expandable_segments`，但会继承调用方显式
+设置的 `PYTORCH_CUDA_ALLOC_CONF`。
+
+### 7.5 Loss
 
 `HierarchicalMoELoss` 的组件包括：
 
@@ -397,7 +422,7 @@ mid-epoch 恢复要求：
 - `load_balance_loss`：主配置实际为 batch-prior 路由正则；
 - `refine_loss`。
 
-### 7.5 W&B
+### 7.6 W&B
 
 W&B 由主配置的 `wandb.*` 或 `train_moe_sam3.py` 参数控制，只在 rank 0 记录。API key 只从
 `--wandb-api-key` 或 `WANDB_API_KEY` 读取，不应写进 YAML：
@@ -524,7 +549,7 @@ paired difference、bootstrap CI、paired sign-flip test 和 Holm 校正。完�
 本地验证结果：
 
 ```text
-MedSAM3-main/tests:       52 passed
+MedSAM3-main/tests:       58 passed
 ablation tests:           12 passed
 ablation path validation: 93/93 cells
 ```
@@ -557,7 +582,8 @@ python ablation/run_ablation.py validate --suite all
   训练，因此不能据此宣称 Dice/HD95 已提高。
 - 正式结论应同时报告 patient-macro 与 slice 指标、MR/US 和面积/边界子组、routing accuracy、
   calibration、fallback 比例、SvANet 触发/跳过比例、参数量、吞吐和显存。
-- 当前不支持 `resample_patients_each_epoch=true`、AMP 训练或 MR/US 两套独立 SvANet。
+- 当前不支持 `resample_patients_each_epoch=true` 或 MR/US 两套独立 SvANet；AMP 支持 BF16 和
+  带 GradScaler 的 FP16，主配置使用 BF16。
 - 单器官内部 token 不能直接推广为无需任务定义的多器官分割接口。
 
 建议先运行 smoke suite，再完成 3-seed primary 筛选；最终论文主比较至少使用 5 个配对 seeds，

@@ -503,7 +503,7 @@ def add_derived_epoch_metrics(metrics: MutableMapping[str, Any]) -> None:
         _add_ratio(metrics, trigger, small, f"{svanet}.trigger_ratio")
         for name in (
             "empty_mask", "unreliable_mask", "low_area_confidence_skip",
-            "no_reliable_roi_skip",
+            "no_reliable_roi_skip", "training_cap_skip",
         ):
             _add_ratio(
                 metrics, f"{svanet}.{name}_count", small,
@@ -516,9 +516,11 @@ def add_derived_epoch_metrics(metrics: MutableMapping[str, Any]) -> None:
             )
         low_skip = f"{svanet}.low_area_confidence_skip_count"
         roi_skip = f"{svanet}.no_reliable_roi_skip_count"
+        cap_skip = f"{svanet}.training_cap_skip_count"
         if low_skip in metrics and roi_skip in metrics:
             metrics[f"{svanet}.total_skip_count"] = (
                 float(metrics[low_skip]) + float(metrics[roi_skip])
+                + float(metrics.get(cap_skip, 0.0))
             )
             _add_ratio(
                 metrics, f"{svanet}.total_skip_count", small,
