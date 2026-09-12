@@ -195,3 +195,51 @@ def test_adapter_rejects_misaligned_router_and_teacher_shapes() -> None:
             pass
         else:
             raise AssertionError(f"invalid shapes must fail closed: {kwargs}")
+
+
+def test_roi_chunking_matches_single_forward_for_values_and_gradients() -> None:
+    def run(roi_chunk_size: int, max_roi_per_step: int = 0):
+        model = ConstantSvANet(foreground_logit=2.0)
+        adapter = _adapter(
+            model, roi_chunk_size=roi_chunk_size, max_roi_per_step=max_roi_per_step
+        )
+        images = torch.randn(4, 3, 8, 8, requires_grad=True)
+        sam3 = torch.full((4, 8, 8), -4.0)
+        sam3[:, 2:6, 3:7] = 6.0
+        gt = torch.zeros(4, 8, 8)
+        gt[:, 2:6, 3:7] = 1.0
+        output = adapter(
+            images,
+            sam3,
+            _small_area_logits(4),
+            area_labels=torch.zeros(4, dtype=torch.long),
+            gt_masks=gt,
+            teacher_area_mask=torch.ones(4, dtype=torch.bool),
+            use_gt_roi=True,
+        )
+        assert model.call_count == (4 if roi_chunk_size else 1)
+        loss = output["refine_loss"]
+        loss.backward()
+        return output, loss.detach(), model.anchor.grad.detach().clone()
+
+    reference_output, reference_loss, reference_grad = run(0)
+    chunked_output, chunked_loss, chunked_grad = run(1)
+
+    assert torch.equal(chunked_output["final_logits"], reference_output["final_logits"])
+    assert torch.equal(chunked_loss, reference_loss)
+    assert torch.equal(chunked_grad, reference_grad)
+
+
+def test_max_roi_per_step_caps_and_reports_skipped_crops() -> None:
+    model = ConstantSvANet()
+    adapter = _adapter(model, max_roi_per_step=1)
+    images = torch.randn(3, 3, 8, 8)
+    sam3 = torch.full((3, 8, 8), -10.0)
+    sam3[:, 2:6, 3:7] = 6.0
+
+    output = adapter(images, sam3, _small_area_logits(3))
+
+    assert model.call_count == 1
+    assert output["trigger_mask"].sum().item() == 1
+    assert output["batch_stats"]["trigger_count"] == 1
+    assert len(output["skipped_indices"]) == 2

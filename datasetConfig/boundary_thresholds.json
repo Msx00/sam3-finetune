@@ -1,0 +1,35 @@
+{
+  "mr": {
+    "contrast_low": 0.06547023236516653,
+    "complexity_high": 1.6771478050279105,
+    "num_samples": 2404,
+    "num_valid_samples": 2404,
+    "fallback_count": 0,
+    "fallback_reasons": {},
+    "threshold_fallback_used": false,
+    "class_counts": {
+      "clear": 1115,
+      "fuzzy": 793,
+      "complex": 496
+    }
+  },
+  "us": {
+    "contrast_low": 0.052337470018011895,
+    "complexity_high": 1.9170132697954152,
+    "num_samples": 2448,
+    "num_valid_samples": 2448,
+    "fallback_count": 0,
+    "fallback_reasons": {},
+    "threshold_fallback_used": false,
+    "class_counts": {
+      "clear": 1073,
+      "fuzzy": 808,
+      "complex": 567
+    }
+  },
+  "boundary_band_width": 3,
+  "contrast_quantile": 0.33,
+  "complexity_quantile": 0.67,
+  "label_rule": "fuzzy_first_then_complex_then_clear",
+  "label_source": "automatic_image_pseudo_label_not_clinical_annotation"
+}

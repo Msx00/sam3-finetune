@@ -8,10 +8,11 @@ merge the resulting foreground logits with SAM3.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -319,6 +320,8 @@ class SvANetROIAdapter(nn.Module):
         max_component_fraction: float = 1.0,
         min_area_confidence: float = 0.0,
         confidence_gate_during_training: bool = False,
+        roi_chunk_size: int = 0,
+        max_roi_per_step: int = 0,
     ) -> None:
         super().__init__()
         if empty_mask_fallback not in self._FALLBACK_CHAINS:
@@ -349,6 +352,10 @@ class SvANetROIAdapter(nn.Module):
                 raise ValueError(f"{name} must be in [0, 1]")
         if int(min_component_pixels) < 1:
             raise ValueError("min_component_pixels must be positive")
+        if int(roi_chunk_size) < 0:
+            raise ValueError("roi_chunk_size must be non-negative (0 = all crops)")
+        if int(max_roi_per_step) < 0:
+            raise ValueError("max_roi_per_step must be non-negative (0 = unlimited)")
         self.svanet = svanet
         self.input_size = tuple(int(value) for value in input_size)
         self.roi_expand_ratio = float(roi_expand_ratio)
@@ -369,6 +376,15 @@ class SvANetROIAdapter(nn.Module):
         self.confidence_gate_during_training = bool(
             confidence_gate_during_training
         )
+        # SvANet refinement is the memory peak of a training step: every
+        # triggered image contributes a full-resolution crop, and running the
+        # whole batch through the 202M-parameter encoder/decoder at once can
+        # exhaust device memory (observed as an NVML assertion inside the CUDA
+        # caching allocator).  ``roi_chunk_size`` splits that forward into
+        # sub-batches so peak activation memory stays bounded, and
+        # ``max_roi_per_step`` caps how many crops are refined per step.
+        self.roi_chunk_size = int(roi_chunk_size)
+        self.max_roi_per_step = int(max_roi_per_step)
         self.reset_runtime_stats()
 
     def reset_runtime_stats(self) -> None:
@@ -401,10 +417,23 @@ class SvANetROIAdapter(nn.Module):
             return output[:, 1] - output[:, 0]
         raise ValueError(f"SvANet output must have 1 or 2 channels, got {output.shape[1]}")
 
-    def _svanet_forward(self, model_input: torch.Tensor) -> Any:
-        """Keep BatchNorm stable when a smoke/medical batch has one small ROI."""
-        if model_input.shape[0] != 1 or not self.svanet.training:
-            return self.svanet(model_input)
+    @contextlib.contextmanager
+    def _singleton_batch_norms(self, sub_batch_sizes: Sequence[int]) -> Iterator[None]:
+        """Keep BatchNorm usable when a forward sub-batch holds one crop.
+
+        ``F.batch_norm`` rejects a sub-batch of one as soon as a branch has
+        pooled the feature map down to 1x1, which SvANet's ASPP global branch
+        does for every crop.  ``roi_chunk_size=1`` therefore turns each chunk
+        into exactly that forbidden shape.  Whenever a forward pass contains
+        such a chunk, the BatchNorm layers run in eval mode for that whole pass
+        and reuse their pretrained running statistics, so the pass cannot
+        change behaviour half-way through.  The affine weights still receive
+        gradients; only the running statistics stay frozen for that pass.
+        Passes without single-crop chunks and inference are left untouched.
+        """
+        if 1 not in sub_batch_sizes or not self.svanet.training:
+            yield
+            return
         batch_norms = [
             module for module in self.svanet.modules()
             if isinstance(module, nn.modules.batchnorm._BatchNorm) and module.training
@@ -412,10 +441,48 @@ class SvANetROIAdapter(nn.Module):
         for module in batch_norms:
             module.eval()
         try:
-            return self.svanet(model_input)
+            yield
         finally:
             for module in batch_norms:
                 module.train()
+
+    def _svanet_forward(self, model_input: torch.Tensor) -> Any:
+        """Forward ROI crops through SvANet with the memory/batch guards applied."""
+        return self._run_svanet(model_input)
+
+    def _run_svanet(self, model_input: torch.Tensor) -> Any:
+        """Run SvANet with bounded memory; math is identical to one big call.
+
+        Splitting the batch into sub-batches keeps the graph connected, so
+        gradients still accumulate across chunks exactly as in a single
+        forward. Chunks are only used while gradients are tracked; inference
+        keeps the original single-call path. Sub-batches of one crop run with
+        BatchNorm in eval mode (see :meth:`_singleton_batch_norms`).
+        """
+        chunk_size = self.roi_chunk_size
+        batch = model_input.shape[0]
+        if chunk_size <= 0 or chunk_size >= batch or not torch.is_grad_enabled():
+            chunks = [model_input]
+        else:
+            chunks = [
+                model_input[start : start + chunk_size]
+                for start in range(0, batch, chunk_size)
+            ]
+        with self._singleton_batch_norms([chunk.shape[0] for chunk in chunks]):
+            outputs = [self.svanet(chunk) for chunk in chunks]
+        if len(outputs) == 1:
+            return outputs[0]
+        if all(isinstance(output, torch.Tensor) for output in outputs):
+            return torch.cat(outputs, dim=0)
+        leading = [output[0] for output in outputs]
+        if all(isinstance(item, torch.Tensor) for item in leading):
+            merged = list(outputs[0])
+            merged[0] = torch.cat(leading, dim=0)
+            return tuple(merged) if isinstance(outputs[0], tuple) else merged
+        raise ValueError(
+            "Chunked SvANet forward requires tensor outputs or tuples beginning "
+            "with a tensor; set svanet.roi_chunk_size=0 to disable chunking"
+        )
 
     @staticmethod
     def _prompt_box(
@@ -527,6 +594,14 @@ class SvANetROIAdapter(nn.Module):
             low_area_confidence.sum().item()
         )
         trigger_indices = trigger.nonzero(as_tuple=False).flatten().tolist()
+        # Bound the number of SvANet crops per step. Crops beyond the cap are
+        # reported as skipped so callers can still index the refined list.
+        trigger_cap = self.max_roi_per_step
+        if trigger_cap > 0 and len(trigger_indices) > trigger_cap:
+            dropped_indices = trigger_indices[trigger_cap:]
+            trigger_indices = trigger_indices[:trigger_cap]
+        else:
+            dropped_indices = []
         prompts = box_prompts or [None] * batch
         prompt_sizes = box_prompt_sizes or [None] * batch
         if len(prompts) != batch:
@@ -547,6 +622,7 @@ class SvANetROIAdapter(nn.Module):
         skipped_indices: List[int] = low_area_confidence.nonzero(
             as_tuple=False
         ).flatten().tolist()
+        skipped_indices.extend(dropped_indices)
         proposal_diagnostics: List[Dict[str, Any]] = []
         batch_empty_mask_count = 0
         batch_unreliable_mask_count = 0

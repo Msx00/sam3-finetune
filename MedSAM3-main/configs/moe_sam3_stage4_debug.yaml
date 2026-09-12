@@ -1,7 +1,7 @@
 # Complete Hierarchical LoRA-MoE-SAM3 configuration.
 
 model:
-  sam3_checkpoint: /mnt/afs/zhemin/zjx/Project/sam3/checkpoint/sam3.pt
+  sam3_checkpoint: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/checkpoint/sam3.pt
   stage1_checkpoint: ""
   stage2_checkpoint: ""
   stage3_checkpoint: ""
@@ -94,21 +94,21 @@ dataset:
   resample_patients_each_epoch: false
   strict_dataset_check: true
   return_format: sam3
-  selected_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/selected_patients.json
-  selected_val_patients_json: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/selected_val_patients.json
-  area_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/area_thresholds.json
+  selected_patients_json: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/selected_patients.json
+  selected_val_patients_json: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/selected_val_patients.json
+  area_threshold_file: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/area_thresholds.json
   area_threshold_mode:
     type: quantile
     q1: 0.33
     q2: 0.67
     exclude_empty_masks: true
-    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/area_thresholds.json
-  boundary_threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/boundary_thresholds.json
+    threshold_file: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/area_thresholds.json
+  boundary_threshold_file: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/boundary_thresholds.json
   boundary_threshold_mode:
     contrast_quantile: 0.33
     complexity_quantile: 0.67
     boundary_band_width: 3
-    threshold_file: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/hierarchical_moe_sam3/boundary_thresholds.json
+    threshold_file: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/boundary_thresholds.json
 
 loss:
   lambda_sam3: 1.0
@@ -126,7 +126,7 @@ svanet:
   enable: true
   source_root: ../SvANet-main
   checkpoint: ""
-  backbone_checkpoint: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/checkpoints/resnet50-11ad3fa6.pth
+  backbone_checkpoint: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/checkpoint/resnet50-11ad3fa6.pth
   shared_across_modalities: true
   mr_checkpoint: ""
   us_checkpoint: ""
@@ -167,7 +167,7 @@ training:
   weight_decay: 0.0001
   data_dir: ""
   amp: false
-  save_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/debug
+  save_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/debug
   resume:  null
   log_interval: 10
   validation_interval: 1
@@ -177,7 +177,7 @@ training:
     eta_min: 0.0
 
 output:
-  output_dir: /mnt/afs/zhemin/zjx/Project/mysam/MedSAM3-main/outputs/debug_stage4_experiment
+  output_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/debug_stage4_experiment
 wandb:
   use_wandb: false
   wandb_project: HMOE-SAM3

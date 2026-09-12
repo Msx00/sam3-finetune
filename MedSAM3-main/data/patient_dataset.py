@@ -33,6 +33,10 @@ from .boundary_labels import (
 _SLICE_PATTERN = re.compile(r"^slice_(\d+)\.png$", re.IGNORECASE)
 _PROMPT_MODES = ("image_only", "text", "coarse_box", "accurate_box")
 
+# Bumped whenever the on-disk label cache layout changes; see
+# ``prepare_slice_labels.py`` for the writer.
+LABEL_CACHE_VERSION = 1
+
 
 def _normalize_prompt_probabilities(
     probabilities: Optional[Dict[str, Any]],
@@ -164,6 +168,7 @@ class PatientDataset(Dataset):
         training: bool = False,
         prompt_curriculum: Optional[Dict[str, Any]] = None,
         prompt_seed: int = 42,
+        label_cache_dir: Optional[str | Path] = None,
     ) -> None:
         self.base_dataset = base_dataset
         self.modality_root = Path(modality_root)
@@ -272,6 +277,22 @@ class PatientDataset(Dataset):
             self.boundary_thresholds = load_boundary_thresholds(boundary_thresholds)
         else:
             self.boundary_thresholds = boundary_thresholds
+        self.label_cache_dir = Path(label_cache_dir) if label_cache_dir else None
+        self.label_cache_split_dir = (
+            self.label_cache_dir / self.modality.lower() / self.split
+            if self.label_cache_dir is not None
+            else None
+        )
+        self.label_cache_band_width = (
+            int(self.boundary_thresholds.get("boundary_band_width", 3))
+            if isinstance(self.boundary_thresholds, dict)
+            else 3
+        )
+        self.label_cache_stats: Dict[str, Any] = {
+            "dir": str(self.label_cache_dir) if self.label_cache_dir else None,
+            "reused": 0,
+            "computed": 0,
+        }
         coco_data = getattr(self.base_dataset, "coco_data", None)
         if isinstance(coco_data, dict):
             try:
@@ -419,6 +440,47 @@ class PatientDataset(Dataset):
         warnings.warn(message + "; sample will be skipped", RuntimeWarning, stacklevel=2)
         return False
 
+    def _load_label_cache(self, patient_id: int) -> Dict[str, Dict[str, Any]]:
+        """Return cached measurements for one patient, or an empty mapping.
+
+        Shards are written by ``prepare_slice_labels.py``.  A missing, stale or
+        unreadable shard is not an error: the caller falls back to computing the
+        measurements for that patient.
+        """
+        if self.label_cache_split_dir is None or self.boundary_thresholds is None:
+            return {}
+        path = self.label_cache_split_dir / f"{patient_id}.json"
+        if not path.is_file():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            warnings.warn(
+                f"Ignoring unreadable label cache shard {path}: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        if int(payload.get("version", -1)) != LABEL_CACHE_VERSION:
+            warnings.warn(
+                f"Ignoring label cache shard with stale version {path}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return {}
+        if int(payload.get("boundary_band_width", -1)) != self.label_cache_band_width:
+            warnings.warn(
+                f"Ignoring label cache shard with stale boundary_band_width {path}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return {}
+        slices = payload.get("slices")
+        return slices if isinstance(slices, dict) else {}
+
     def _text_prompt_for_image(self, image_id: int) -> str:
         annotations = getattr(self.base_dataset, "img_to_anns", {}).get(image_id, [])
         categories = getattr(self.base_dataset, "categories", {})
@@ -430,6 +492,7 @@ class PatientDataset(Dataset):
         coco_index = self._coco_index_by_file_name()
         records: List[PatientSliceRecord] = []
         for patient_id in self.patient_ids:
+            cached_slices = self._load_label_cache(patient_id)
             patient_dir = self.split_root / str(patient_id)
             slices = []
             for path in patient_dir.iterdir():
@@ -483,6 +546,7 @@ class PatientDataset(Dataset):
                 if resolved_image is None:
                     continue
                 mask_path: Optional[Path] = None
+                cached_entry = cached_slices.get(image_path.name)
                 if self.mask_split_root is not None:
                     mask_path = resolve_sample_path(
                         self.mask_split_root,
@@ -493,15 +557,23 @@ class PatientDataset(Dataset):
                     )
                     if mask_path is None:
                         continue
-                    try:
-                        with PILImage.open(mask_path) as mask_image:
-                            mask_image.verify()
-                    except Exception as error:
-                        self._problem(
-                            f"Malformed mask PNG for {relative_name}: {error}",
-                            ValueError,
+                    if cached_entry is not None and "error" in cached_entry:
+                        raise RuntimeError(
+                            f"Cached label extraction failed for {relative_name}: "
+                            f"{cached_entry['error']}"
                         )
-                        continue
+                    if not (
+                        cached_entry is not None and cached_entry.get("mask_verified")
+                    ):
+                        try:
+                            with PILImage.open(mask_path) as mask_image:
+                                mask_image.verify()
+                        except Exception as error:
+                            self._problem(
+                                f"Malformed mask PNG for {relative_name}: {error}",
+                                ValueError,
+                            )
+                            continue
                 boxes = self.boxes_index.get(relative_name) if self.boxes_index else None
                 if self.boxes_index and boxes is None:
                     self._problem(
@@ -524,7 +596,29 @@ class PatientDataset(Dataset):
                             ValueError,
                         )
                         continue
-                area_ratio = compute_area_ratio(mask_path) if mask_path is not None else 0.0
+                boundary_contrast = 0.0
+                boundary_complexity = 1.0
+                boundary_fallback = False
+                if mask_path is not None and cached_entry is not None:
+                    area_ratio = float(cached_entry["area_ratio"])
+                    boundary_contrast = float(cached_entry["boundary_contrast"])
+                    boundary_complexity = float(cached_entry["boundary_complexity"])
+                    boundary_fallback = bool(
+                        cached_entry.get("boundary_fallback", False)
+                    )
+                    self.label_cache_stats["reused"] += 1
+                else:
+                    area_ratio = (
+                        compute_area_ratio(mask_path) if mask_path is not None else 0.0
+                    )
+                    self.label_cache_stats["computed"] += 1
+                    if self.boundary_thresholds is not None and mask_path is not None:
+                        boundary_scores = compute_boundary_scores(
+                            resolved_image, mask_path, self.label_cache_band_width
+                        )
+                        boundary_contrast = boundary_scores.contrast
+                        boundary_complexity = boundary_scores.complexity
+                        boundary_fallback = boundary_scores.used_fallback
                 area_label = -1
                 if self.area_thresholds is not None:
                     area_label = area_label_from_ratio(
@@ -532,23 +626,11 @@ class PatientDataset(Dataset):
                         float(self.area_thresholds["small_max"]),
                         float(self.area_thresholds["medium_max"]),
                     )
-                boundary_contrast = 0.0
-                boundary_complexity = 1.0
                 boundary_label = -1
-                boundary_fallback = False
                 if self.boundary_thresholds is not None and mask_path is not None:
-                    band_width = int(
-                        self.boundary_thresholds.get("boundary_band_width", 3)
-                    )
-                    boundary_scores = compute_boundary_scores(
-                        resolved_image, mask_path, band_width
-                    )
                     modality_thresholds = self.boundary_thresholds[
                         self.modality.lower()
                     ]
-                    boundary_contrast = boundary_scores.contrast
-                    boundary_complexity = boundary_scores.complexity
-                    boundary_fallback = boundary_scores.used_fallback
                     boundary_label = boundary_label_from_scores(
                         boundary_contrast,
                         boundary_complexity,

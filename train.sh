@@ -3,13 +3,20 @@ set -euo pipefail
 
 # Resolve code relative to this script so the repository can be cloned to any
 # server directory. Dataset/checkpoint paths remain defined by the YAML config.
+#
+# Default run: start from checkpoint/sam3.pt and train every module group
+# jointly from scratch. No stage1-4 checkpoint is loaded and no curriculum is
+# applied. STAGE is intentionally left empty so the stage used by the code is
+# taken from the YAML (training.stage); set STAGE=<n> only if you deliberately
+# want a different stage.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-${SCRIPT_DIR}/MedSAM3-main}"
 CONDA_SH="${CONDA_SH:-/mnt/afs/zhemin/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-sam3}"
-CONFIG="${CONFIG:-${PROJECT_ROOT}/configs/moe_sam3_stage5_direct.yaml}"
-GPU_IDS="${GPU_IDS:-0 1}"
+CONFIG="${CONFIG:-${PROJECT_ROOT}/configs/moe_sam3_train_from_scratch.yaml}"
+GPU_IDS="${GPU_IDS:-0}"
 RESUME="${RESUME:-}"
+STAGE="${STAGE:-}"
 
 [[ -d "${PROJECT_ROOT}" ]] || { echo "Project not found: ${PROJECT_ROOT}"; exit 1; }
 [[ -f "${CONDA_SH}" ]] || { echo "Conda init not found: ${CONDA_SH}"; exit 1; }
@@ -37,22 +44,25 @@ if [[ ${#DEVICE_ARGS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-LOG_DIR="${PROJECT_ROOT}/outputs/stage5_direct_noise/logs"
+LOG_DIR="${PROJECT_ROOT}/outputs/train_from_scratch/logs"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/train_v2_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
 
 COMMAND=(
   python -u train_moe_sam3.py
   --config "${CONFIG}"
   --device "${DEVICE_ARGS[@]}"
-  --stage 5
 )
+if [[ -n "${STAGE}" ]]; then
+  COMMAND+=(--stage "${STAGE}")
+fi
 if [[ -n "${RESUME}" ]]; then
   COMMAND+=(--resume "${RESUME}")
 fi
 
 echo "Config: ${CONFIG}"
 echo "GPU IDs: ${GPU_IDS}"
+echo "Stage: ${STAGE:-<from config>}"
 echo "Resume: ${RESUME:-disabled}"
 echo "Log: ${LOG_FILE}"
 "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"

@@ -1,3 +1,21 @@
-# Bash cannot parse CRLF reliably. Force LF on every checkout, including on
-# servers whose global Git configuration enables core.autocrlf.
-*.sh text eol=lf
+# Normalize line endings to LF so shell scripts and sources stay portable.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+*.pdf  binary
+*.pth  binary
+*.pt   binary
+*.ckpt binary
+*.png  binary
+*.jpg  binary
+*.npy  binary
+*.npz  binary
+*.nii  binary
+*.gz   binary

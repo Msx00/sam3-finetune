@@ -168,6 +168,11 @@ mysam/
 │   ├── summarize_ablation.py
 │   └── test_ablation.py
 ├── SvANet-main/                     # SvANet 上游代码
+├── data-preprocess/                 # 一次性生成训练数据（COCO/box/patient/标签缓存）
+│   ├── run_preprocess.sh            # 预处理入口，与 train.sh 同样的配置约定
+│   ├── preprocess.py
+│   ├── test_preprocess.py
+│   └── README.md
 ├── unified_preprocess_and_coco_20260410.py
 └── trans_format.py
 ```
@@ -246,6 +251,11 @@ python trans_format.py \
 
 COCO 内的 `bbox` 仍是 `[x,y,w,h]`；单独的 box prompt JSON 使用
 `[x1,y1,x2,y2]`。若 COCO segmentation 为空，必须配置可解析的 mask root。
+
+以上产物（最终 COCO、SAM3 box JSON、train/val patient manifest、面积/边界阈值、逐 slice 的
+area/boundary 标签缓存）可以用 `data-preprocess/run_preprocess.sh` 一次性生成并校验：
+标签缓存把训练启动时每 slice 约 0.4–3 s 的现算变成直接读 JSON（当前配置 23k slice，
+缓存后每个数据集约 13 s）。用法见 [data-preprocess/README.md](data-preprocess/README.md)。
 
 ### 5.3 路由标签的作用
 

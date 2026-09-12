@@ -1,7 +1,11 @@
-# Direct Stage 5 joint-training configuration.
-# Stage 1-4 checkpoints are intentionally empty: all Stage 5 trainable groups
-# start from their normal SAM3/SvANet initialization instead of staged weights.
-
+# 从零开始的联合训练配置（不是 1-4 阶段的课程学习）。
+# - 只加载 model.sam3_checkpoint（项目内 checkpoint/sam3.pt）作为初始权重。
+# - stage1..4_checkpoint 全部留空：代码里的 load_dependencies() 会直接跳过，
+#   不会加载任何阶段权重。
+# - 所有可训练模块（shared_lora / expert_lora / router / auxiliary_head /
+#   svanet / decoder）从第 1 个 epoch 起同时训练。
+# - training.stage: 5 只是代码内部用于选择“全部参数组 + 全部损失”的开关，
+#   与阶段课程无关。
 model:
   sam3_checkpoint: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/checkpoint/sam3.pt
   stage1_checkpoint: ""
@@ -37,22 +41,69 @@ moe:
   router_hidden_dim: 256
   routing_mode: top1
   temperature: 1.0
+  # True HMoE: modality is the parent and each modality owns conditional
+  # area/boundary child distributions.
+  conditional_hierarchy: true
+  use_image_locator: true
+  locator_hidden_dim: 128
+  # Route strictly from the visual FPN tensor captured before SAM3 fuses any
+  # text/geometry prompt. ``decoder_memory`` exists only as a legacy ablation.
+  routing_feature_source: backbone_fpn
+  # Confidence controller: uncertain samples stay on the shared SAM3/LoRA path;
+  # medium-confidence samples blend top-2 experts, high-confidence samples top-1.
+  confidence_routing: true
+  confidence_low_threshold: 0.35
+  confidence_high_threshold: 0.70
+  confidence_top_k: 2
+  confidence_fallback: shared
+  router_regularizer: batch_prior
+  residual_scale_init: 0.1
+  residual_scale_max: 1.0
+  learnable_residual_scale: true
 
 router:
   routing_type: top1
   modality_hidden_dim: 256
   area_hidden_dim: 256
   boundary_hidden_dim: 256
+  router_source_layer: 3
   use_gt_modality_during_train: true
   use_gt_area_during_warmup: true
   use_gt_boundary_during_warmup: true
   teacher_forcing:
     enabled: true
-    start_ratio: 1.0
+    start_ratio: 0.5
     end_ratio: 0.0
-    decay_epochs: 20
+    decay_epochs: 10
 
 dataset:
+  # Training-only XYXY box perturbation. Std is relative to box width/height;
+  # each coordinate offset is then clipped to this many pixels.
+  box_noise_std: 0.1
+  box_noise_max: 10
+  # The public input remains a slice.  "image_only" uses only the fixed,
+  # task-level word below internally and never uses a sample-specific GT box.
+  # The schedule removes accurate boxes and emphasizes deployment conditions.
+  prompt_curriculum:
+    enabled: true
+    fixed_text: prostate
+    seed: 42
+    decay_epochs: 20
+    evaluation_mode: image_only
+    start_probabilities:
+      image_only: 0.30
+      text: 0.10
+      coarse_box: 0.40
+      accurate_box: 0.20
+    end_probabilities:
+      image_only: 0.70
+      text: 0.10
+      coarse_box: 0.20
+      accurate_box: 0.00
+    coarse_box_expand_min: 0.15
+    coarse_box_expand_max: 0.45
+    coarse_box_jitter_std: 0.10
+    coarse_box_jitter_max: 20
   mr_image_root: ""
   mr_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-2d"
   mr_mask_root: "/mnt/afs/zhemin/ShixingMa/dataset/seg/mr-mask-2d"
@@ -96,6 +147,11 @@ dataset:
   return_format: sam3
   selected_patients_json: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/selected_patients.json
   selected_val_patients_json: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/selected_val_patients.json
+  # Per-slice area/boundary measurements cached by
+  # sam3-finetune/prepare_slice_labels.py.  Leave empty to measure on every
+  # launch (slow: ~0.4 s/slice with a single thread, ~3 s/slice with a large
+  # PyTorch thread pool).
+  label_cache_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/data-preprocess/labels
   area_threshold_file: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/datasetConfig/area_thresholds.json
   area_threshold_mode:
     type: quantile
@@ -115,6 +171,7 @@ loss:
   # presence, box L1/GIoU, native mask focal and mask Dice).
   lambda_sam3: 1.0
   lambda_aux: 1.0
+  lambda_locator: 0.5
   lambda_modality: 1.0
   lambda_area: 1.0
   lambda_area_reg: 0.2
@@ -133,15 +190,40 @@ svanet:
   mr_checkpoint: ""
   us_checkpoint: ""
   input_size: [512, 512]
+  # SvANet refinement runs every triggered ROI crop through a 202M-parameter
+  # encoder/decoder; one 512x512 crop costs ~5 GiB in the backward pass, so
+  # the full batch of eight exhausts the 40 GiB MIG slice and takes the driver
+  # down (surfaces as an NVML assertion in the CUDA caching allocator).  Crops
+  # are therefore refined one at a time, with at most four crops per optimizer
+  # step.  Set roi_chunk_size=0 to disable chunking, max_roi_per_step=0 for no
+  # per-step cap.
+  roi_chunk_size: 1
+  max_roi_per_step: 4
   roi_expand_ratio: 0.25
   min_roi_size: 32
   mask_threshold: 0.5
-  train_trigger: gt
-  empty_mask_fallback: box_then_full_image
-  paste_mode: replace_roi
-  outside_roi: zero
-  use_gt_roi_for_warmup: true
-  gt_roi_warmup_epochs: 25
+  train_trigger: teacher_forcing
+  empty_mask_fallback: locator_then_box_then_skip
+  paste_mode: blend_with_sam3
+  outside_roi: sam3
+  fusion_weight: 0.35
+  residual_scale: 0.25
+  sam3_min_confidence: 0.55
+  locator_threshold: 0.5
+  locator_min_confidence: 0.55
+  min_component_pixels: 16
+  max_component_fraction: 0.8
+  min_area_confidence: 0.45
+  confidence_gate_during_training: false
+  # GT masks only bootstrap ROI selection early; training reaches the exact
+  # predicted-ROI inference path after epoch 10.
+  roi_teacher_forcing:
+    enabled: true
+    start_ratio: 0.5
+    end_ratio: 0.0
+    decay_epochs: 10
+  use_gt_roi_for_warmup: false
+  gt_roi_warmup_epochs: 0
 
 optimizer:
   # Conservative learning rates for direct, non-staged joint training.
@@ -162,18 +244,34 @@ stages:
   train_shared_lora_stage5: true
 
 training:
+  # 代码内部标识：5 = 全部参数组联合训练；不加载任何阶段权重。
   stage: 5
-  # Run three epochs first; extend only after checking stability and validation.
-  epochs: 3
-  num_epochs: 3
-  batch_size: 4
+  # All model, routing, NumPy and Python RNGs use this seed. Ablation configs
+  # override it per repeat while keeping the data-order seed paired.
+  seed: 42
+  deterministic: true
+  deterministic_warn_only: true
+  cudnn_benchmark: false
+  # Full direct Stage-5 schedule; validation remains patient-disjoint.
+  epochs: 100
+  num_epochs: 100
+  batch_size: 8
   num_workers: 0
   learning_rate: 0.00001
   weight_decay: 0.0001
   data_dir: ""
   amp: false
-  save_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/stage5_direct_v2  # Direct Stage 5 must not resume a Stage 4 checkpoint.
+  save_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/train_from_scratch
+  # Direct Stage 5 must not resume a Stage 4 checkpoint.
   resume: null
+  # Legacy checkpoints did not store stable optimizer parameter names. Their
+  # model/batch progress is restored while incompatible Adam state is reset.
+  resume_optimizer: true
+  # Overwrite one complete checkpoint every N optimizer updates. Set to 0 to
+  # disable. Mid-epoch DDP resume requires the same GPU count as the checkpoint.
+  checkpoint_interval_steps: 500
+  step_checkpoint_name: stage5_step_last.pt
+  data_order_seed: 42
   log_interval: 10
   validation_interval: 1
   scheduler:
@@ -182,23 +280,23 @@ training:
     eta_min: 0.0
 
 output:
-  output_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/stage5_direct_v2
+  output_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/train_from_scratch
 
 wandb:
   use_wandb: true
   wandb_project: HMOE-SAM3
   wandb_entity: null
-  wandb_name: stage5-direct_v2
-  wandb_group: direct-stage5
+  wandb_name: moe-sam3-from-scratch
+  wandb_group: from-scratch-joint
   wandb_tags:
-    - stage5
+    - from-scratch
     - direct-training
     - joint
     - sam3
     - svanet
   wandb_mode: online
-  wandb_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/stage5_direct/wandb
+  wandb_dir: /mnt/afs/zhemin/ShixingMa/Project/sam3-finetune/MedSAM3-main/outputs/train_from_scratch/wandb
   wandb_log_interval: 10
   wandb_watch_model: false
   wandb_resume: allow
-  wandb_run_id: null
+  wandb_run_id: new

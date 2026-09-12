@@ -1045,6 +1045,12 @@ class SAM3TrainerNative:
                             "confidence_gate_during_training", False
                         )
                     ),
+                    roi_chunk_size=int(
+                        self.svanet_config.get("roi_chunk_size", 0)
+                    ),
+                    max_roi_per_step=int(
+                        self.svanet_config.get("max_roi_per_step", 0)
+                    ),
                 ).to(self.device)
 
         stats = count_parameters(self.model)
@@ -1839,8 +1845,22 @@ class SAM3TrainerNative:
                     prompt_seed=int(
                         (cfg.get("prompt_curriculum") or {}).get("seed", seed)
                     ),
+                    label_cache_dir=cfg.get("label_cache_dir"),
                 )
             )
+            dataset = datasets[-1]
+            stats = getattr(dataset, "label_cache_stats", None)
+            if stats and stats.get("dir"):
+                total = int(stats["reused"]) + int(stats["computed"])
+                print_rank0(
+                    f"  {modality.upper()}/{split} area+boundary labels: "
+                    f"{stats['reused']}/{total} from cache ({stats['dir']})"
+                )
+            if stats and stats.get("dir") and stats.get("computed"):
+                print_rank0(
+                    f"  WARNING: {stats['computed']} slices were recomputed at "
+                    "~0.4 s each; re-run prepare_slice_labels.py to refresh the cache"
+                )
         if not datasets:
             raise ValueError("Patient dataset config must provide mr_root and/or us_root")
         output_dir = Path(self.config["output"]["output_dir"])
